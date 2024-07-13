@@ -6,12 +6,15 @@ from torchvision import transforms
 from models.dsgan import DSGenerator
 from utils.annotations import load_yolo_annotations, save_annotations
 from utils.video_processing import extract_frames, calculate_optical_flow
+import argparse
 
 # Load pre-trained models
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-generator = DSGenerator().to(device)
-generator.load_state_dict(torch.load('models/dsgan_generator_200.pth'))
-generator.eval()
+def load_generator(model_path):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    generator = DSGenerator().to(device)
+    generator.load_state_dict(torch.load(model_path))
+    generator.eval()
+    return generator
 
 transform = transforms.Compose([
     transforms.ToTensor(),
@@ -74,3 +77,17 @@ def inpaint_video_with_gan(video_path, annotation_path, output_video_path, gener
 
     save_annotations(new_annotations, output_annotation_path)
     save_fused_video(inpainted_frames, output_video_path)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Inpaint Video with DS-GAN")
+    parser.add_argument('--video_path', type=str, required=True, help='Path to the input video file')
+    parser.add_argument('--annotation_path', type=str, required=True, help='Path to the annotation file')
+    parser.add_argument('--output_video_path', type=str, required=True, help='Path to save the output video')
+    parser.add_argument('--output_annotation_path', type=str, required=True, help='Path to save the output annotation file')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to the trained DS-GAN generator model')
+
+    args = parser.parse_args()
+
+    generator = load_generator(args.model_path)
+    inpaint_video_with_gan(args.video_path, args.annotation_path, args.output_video_path, generator, args.output_annotation_path)
+

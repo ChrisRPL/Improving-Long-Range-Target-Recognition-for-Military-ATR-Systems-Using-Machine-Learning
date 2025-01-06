@@ -11,6 +11,7 @@ def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_pat
     visible_frames, filenames = extract_frames(visible_video_path)
     mwir_frames, _ = extract_frames(mwir_video_path)
     print("frames read")
+    print(f"Number of frames read: {len(visible_frames)}")
     min_frames = min(len(visible_frames), len(mwir_frames))
     visible_frames = visible_frames[:min_frames]
     mwir_frames = mwir_frames[:min_frames]

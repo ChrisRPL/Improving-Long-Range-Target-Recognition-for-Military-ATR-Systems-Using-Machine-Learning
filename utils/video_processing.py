@@ -13,7 +13,7 @@ def extract_frames(folder_path):
        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
            image_path = os.path.join(folder_path, filename)
            frame = cv2.imread(image_path)
-           frames.append(frame)
+           frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
            filenames.append(filename)
    return frames, filenames
 

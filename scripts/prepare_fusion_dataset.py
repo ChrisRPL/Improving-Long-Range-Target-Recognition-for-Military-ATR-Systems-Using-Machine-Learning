@@ -1,12 +1,16 @@
 import os
 import cv2
 import argparse
-from utils.video_processing import extract_frames, align_frames, compute_optical_flow, wavelet_fusion, save_fused_video
+import sys
+from pathlib import Path
+from utils.video_processing import extract_frames, align_frames, compute_optical_flow, wavelet_fusion, save_fused_frames
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path):
-    visible_frames = extract_frames(visible_video_path)
-    mwir_frames = extract_frames(mwir_video_path)
-
+    visible_frames, filenames = extract_frames(visible_video_path)
+    mwir_frames, _ = extract_frames(mwir_video_path)
+    print("frames read")
     min_frames = min(len(visible_frames), len(mwir_frames))
     visible_frames = visible_frames[:min_frames]
     mwir_frames = mwir_frames[:min_frames]
@@ -21,7 +25,7 @@ def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_pat
         fused_frame = wavelet_fusion(v_frame, m_frame)
         fused_frames.append(fused_frame)
 
-    save_fused_video(fused_frames, output_video_path)
+    save_fused_frames(fused_frames, output_video_path, filenames)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare Fusion Dataset")

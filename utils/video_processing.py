@@ -1,20 +1,21 @@
 import cv2
 import numpy as np
 import pywt
+import os
 from skimage.feature import match_descriptors, ORB
 from skimage.transform import ProjectiveTransform, warp
 from skimage.measure import ransac
 
-def extract_frames(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-    cap.release()
-    return frames
+def extract_frames(folder_path):
+   frames = []
+   filenames = []
+   for filename in sorted(os.listdir(folder_path)):
+       if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+           image_path = os.path.join(folder_path, filename)
+           frame = cv2.imread(image_path)
+           frames.append(frame)
+           filenames.append(filename)
+   return frames, filenames
 
 def detect_and_match_features(img1, img2):
     orb = ORB(n_keypoints=500)
@@ -35,7 +36,7 @@ def align_frames(visible_frames, mwir_frames, target_size):
     for i in range(len(visible_frames)):
         # Resize MWIR frame to the target size (same as visible frame)
         mwir_resized = cv2.resize(mwir_frames[i], target_size)
-        
+        print("aligning")
         keypoints1, keypoints2, matches = detect_and_match_features(visible_frames[i], mwir_resized)
 
         src = keypoints2[matches[:, 1]][:, ::-1]
@@ -73,13 +74,12 @@ def wavelet_fusion(visible_frame, mwir_frame):
     fused_frame = pywt.idwt2(fused_coeffs, 'db1')
     return fused_frame
 
-def save_fused_video(fused_frames, output_path, fps=30):
-    height, width = fused_frames[0].shape
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height), isColor=False)
-    for frame in fused_frames:
-        out.write(cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype('uint8'))
-    out.release()
+def save_fused_frames(fused_frames, output_folder, original_filenames):
+   os.makedirs(output_folder, exist_ok=True)
+   for frame, filename in zip(fused_frames, original_filenames):
+       normalized = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
+       output_path = os.path.join(output_folder, filename)
+       cv2.imwrite(output_path, normalized)
 
 def fuse_videos(visible_video_path, mwir_video_path, output_video_path):
     visible_frames = extract_frames(visible_video_path)

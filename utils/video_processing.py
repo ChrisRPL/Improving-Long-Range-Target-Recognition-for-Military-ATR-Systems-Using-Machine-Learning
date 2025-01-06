@@ -33,48 +33,33 @@ def detect_and_match_features(img1, img2):
 
 def align_frames(visible_frames, mwir_frames, target_size):
     aligned_mwir_frames = []
-    for i in range(len(visible_frames)):
-        mwir_resized = cv2.resize(mwir_frames[i], target_size)
-        aligned_mwir_frames.append(mwir_resized)  # Simple resize for now
+    for mwir_frame in mwir_frames:
+        aligned_mwir_frames.append(cv2.resize(mwir_frame, target_size))
     return aligned_mwir_frames
 
 def compute_optical_flow(visible_frames, aligned_mwir_frames):
-    flow_frames = []
-    for v_frame, m_frame in zip(visible_frames, aligned_mwir_frames):
-        # Ensure frames are uint8
-        v_frame = v_frame.astype(np.uint8)
-        m_frame = m_frame.astype(np.uint8)
-        
-        v_gray = cv2.cvtColor(v_frame, cv2.COLOR_BGR2GRAY)
-        m_gray = cv2.cvtColor(m_frame, cv2.COLOR_BGR2GRAY)
-        
-        flow = cv2.calcOpticalFlowFarneback(m_gray, v_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        
-        h, w = flow.shape[:2]
-        flow_map = np.zeros((h, w, 2), dtype=np.float32)
-        flow_map[:, :, 0] = np.repeat(np.arange(w), h).reshape(w, h).T + flow[:, :, 0]
-        flow_map[:, :, 1] = np.tile(np.arange(h), w).reshape(h, w) + flow[:, :, 1]
-        
-        remapped_frame = cv2.remap(m_frame, flow_map[:, :, 0], flow_map[:, :, 1], cv2.INTER_LINEAR)
-        flow_frames.append(remapped_frame)
-    return flow_frames
+    return aligned_mwir_frames  # Skip optical flow for now
 
 def wavelet_fusion(visible_frame, mwir_frame):
-    # Normalize both frames to 0-1 range
-    visible_norm = cv2.normalize(visible_frame.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
-    mwir_norm = cv2.normalize(mwir_frame.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
+    # Ensure both frames are uint8
+    visible_frame = np.clip(visible_frame, 0, 255).astype(np.uint8)
+    mwir_frame = np.clip(mwir_frame, 0, 255).astype(np.uint8)
     
-    # Simple weighted fusion
-    fused = cv2.addWeighted(visible_norm, 0.7, mwir_norm, 0.3, 0)
+    # Convert to grayscale
+    mwir_gray = cv2.cvtColor(mwir_frame, cv2.COLOR_BGR2GRAY)
+    mwir_colored = cv2.cvtColor(mwir_gray, cv2.COLOR_GRAY2BGR)
     
-    # Convert back to uint8
-    result = (fused * 255).astype(np.uint8)
+    # Simple alpha blending
+    alpha = 0.6
+    beta = 0.4
+    fused = cv2.addWeighted(visible_frame, alpha, mwir_colored, beta, 0)
     
-    return result
+    return fused
 
 def save_fused_frames(fused_frames, output_folder, original_filenames):
     os.makedirs(output_folder, exist_ok=True)
     for frame, filename in zip(fused_frames, original_filenames):
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
         output_path = os.path.join(output_folder, filename)
         cv2.imwrite(output_path, frame)
 

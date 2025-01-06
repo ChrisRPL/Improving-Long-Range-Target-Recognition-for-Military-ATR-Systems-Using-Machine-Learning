@@ -36,7 +36,6 @@ def align_frames(visible_frames, mwir_frames, target_size):
     for i in range(len(visible_frames)):
         mwir_resized = cv2.resize(mwir_frames[i], target_size)
         
-        # Convert to grayscale for feature detection
         visible_gray = cv2.cvtColor(visible_frames[i], cv2.COLOR_BGR2GRAY)
         mwir_gray = cv2.cvtColor(mwir_resized, cv2.COLOR_BGR2GRAY)
         
@@ -48,13 +47,18 @@ def align_frames(visible_frames, mwir_frames, target_size):
         model_robust, inliers = ransac((src, dst), ProjectiveTransform, min_samples=4,
                                      residual_threshold=2, max_trials=300)
         warped = warp(mwir_resized, model_robust.inverse, output_shape=visible_frames[i].shape)
+        # Convert to uint8
+        warped = (warped * 255).astype(np.uint8)
         aligned_mwir_frames.append(warped)
     return aligned_mwir_frames
 
 def compute_optical_flow(visible_frames, aligned_mwir_frames):
     flow_frames = []
     for v_frame, m_frame in zip(visible_frames, aligned_mwir_frames):
-        # Convert to grayscale for optical flow
+        # Ensure frames are uint8
+        v_frame = v_frame.astype(np.uint8)
+        m_frame = m_frame.astype(np.uint8)
+        
         v_gray = cv2.cvtColor(v_frame, cv2.COLOR_BGR2GRAY)
         m_gray = cv2.cvtColor(m_frame, cv2.COLOR_BGR2GRAY)
         

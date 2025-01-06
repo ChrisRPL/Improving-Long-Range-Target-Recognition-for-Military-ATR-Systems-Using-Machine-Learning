@@ -35,29 +35,7 @@ def align_frames(visible_frames, mwir_frames, target_size):
     aligned_mwir_frames = []
     for i in range(len(visible_frames)):
         mwir_resized = cv2.resize(mwir_frames[i], target_size)
-        
-        # Convert to grayscale for feature matching
-        visible_gray = cv2.cvtColor(visible_frames[i], cv2.COLOR_BGR2GRAY)
-        mwir_gray = cv2.cvtColor(mwir_resized, cv2.COLOR_BGR2GRAY)
-        
-        keypoints1, keypoints2, matches = detect_and_match_features(visible_gray, mwir_gray)
-        
-        if len(matches) < 4:
-            aligned_mwir_frames.append(mwir_resized)
-            continue
-
-        src = keypoints2[matches[:, 1]][:, ::-1]
-        dst = keypoints1[matches[:, 0]][:, ::-1]
-
-        try:
-            model_robust, inliers = ransac((src, dst), ProjectiveTransform, 
-                                         min_samples=4, residual_threshold=2, max_trials=300)
-            warped = cv2.warpPerspective(mwir_resized, model_robust.params, 
-                                       (visible_frames[i].shape[1], visible_frames[i].shape[0]))
-            aligned_mwir_frames.append(warped)
-        except:
-            aligned_mwir_frames.append(mwir_resized)
-            
+        aligned_mwir_frames.append(mwir_resized)  # Simple resize for now
     return aligned_mwir_frames
 
 def compute_optical_flow(visible_frames, aligned_mwir_frames):
@@ -82,59 +60,23 @@ def compute_optical_flow(visible_frames, aligned_mwir_frames):
     return flow_frames
 
 def wavelet_fusion(visible_frame, mwir_frame):
-    # Convert to float32 for better precision
-    visible_float = visible_frame.astype(np.float32) / 255.0
-    mwir_float = mwir_frame.astype(np.float32) / 255.0
+    # Normalize both frames to 0-1 range
+    visible_norm = cv2.normalize(visible_frame.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
+    mwir_norm = cv2.normalize(mwir_frame.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
     
-    # Fusion in LAB color space
-    visible_lab = cv2.cvtColor(visible_float, cv2.COLOR_BGR2LAB)
-    mwir_lab = cv2.cvtColor(mwir_float, cv2.COLOR_BGR2LAB)
+    # Simple weighted fusion
+    fused = cv2.addWeighted(visible_norm, 0.7, mwir_norm, 0.3, 0)
     
-    # Split channels
-    visible_l, visible_a, visible_b = cv2.split(visible_lab)
-    mwir_l, mwir_a, mwir_b = cv2.split(mwir_lab)
+    # Convert back to uint8
+    result = (fused * 255).astype(np.uint8)
     
-    # Fuse luminance channel using wavelets
-    coeffs_visible = pywt.wavedec2(visible_l, 'sym4', level=2)
-    coeffs_mwir = pywt.wavedec2(mwir_l, 'sym4', level=2)
-    
-    fused_coeffs = []
-    for i in range(len(coeffs_visible)):
-        if i == 0:
-            # Average approximation coefficients
-            fused_coeffs.append((coeffs_visible[0] + coeffs_mwir[0]) / 2)
-        else:
-            # Maximum selection rule for detail coefficients
-            detail_v = coeffs_visible[i]
-            detail_m = coeffs_mwir[i]
-            fused_detail = []
-            
-            for v_coeff, m_coeff in zip(detail_v, detail_m):
-                mask = np.abs(v_coeff) > np.abs(m_coeff)
-                fused_coeff = np.where(mask, v_coeff, m_coeff)
-                fused_detail.append(fused_coeff)
-            fused_coeffs.append(tuple(fused_detail))
-    
-    # Reconstruct fused luminance
-    fused_l = pywt.waverec2(fused_coeffs, 'sym4')
-    
-    # Keep color information from visible image
-    fused_lab = cv2.merge([fused_l, visible_a, visible_b])
-    fused_bgr = cv2.cvtColor(fused_lab, cv2.COLOR_LAB2BGR)
-    
-    # Enhance contrast
-    fused_enhanced = np.clip(fused_bgr * 255, 0, 255).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    fused_enhanced = clahe.apply(cv2.cvtColor(fused_enhanced, cv2.COLOR_BGR2GRAY))
-    
-    return cv2.cvtColor(fused_enhanced, cv2.COLOR_GRAY2BGR)
+    return result
 
 def save_fused_frames(fused_frames, output_folder, original_filenames):
-   os.makedirs(output_folder, exist_ok=True)
-   for frame, filename in zip(fused_frames, original_filenames):
-       normalized = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
-       output_path = os.path.join(output_folder, filename)
-       cv2.imwrite(output_path, normalized)
+    os.makedirs(output_folder, exist_ok=True)
+    for frame, filename in zip(fused_frames, original_filenames):
+        output_path = os.path.join(output_folder, filename)
+        cv2.imwrite(output_path, frame)
 
 def fuse_videos(visible_video_path, mwir_video_path, output_video_path):
     visible_frames = extract_frames(visible_video_path)

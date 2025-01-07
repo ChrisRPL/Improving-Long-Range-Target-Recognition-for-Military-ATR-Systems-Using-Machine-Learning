@@ -5,11 +5,20 @@ import os
 from skimage.feature import match_descriptors, ORB
 from skimage.transform import ProjectiveTransform, warp
 from skimage.measure import ransac
+import json
 
-def extract_frames(folder_path):
+def extract_frames(folder_path, matching_dict, image_type):
    frames = []
    filenames = []
-   for filename in sorted(os.listdir(folder_path)):
+   with open(matching_dict) as json_file:
+       data = json.load(json_file)
+   
+   if image_type == "visible":
+       filenames = list(data.keys())
+   else:
+       filenames = list(data.values())
+   
+   for filename in filenames:
        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
            image_path = os.path.join(folder_path, filename)
            frame = cv2.imread(image_path)

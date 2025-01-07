@@ -7,10 +7,10 @@ from utils.video_processing import extract_frames, align_frames, compute_optical
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path):
+def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path, matching_dict_path):
     # Extract frames and filenames
-    visible_frames, visible_filenames = extract_frames(visible_video_path)
-    mwir_frames, mwir_filenames = extract_frames(mwir_video_path)
+    visible_frames, visible_filenames = extract_frames(visible_video_path, matching_dict_path, "visible")
+    mwir_frames, mwir_filenames = extract_frames(mwir_video_path, matching_dict_path, "thermal")
     
     print(f"Visible frames: {len(visible_frames)}, MWIR frames: {len(mwir_frames)}")
     
@@ -39,8 +39,9 @@ if __name__ == "__main__":
     parser.add_argument('--visible_video_path', type=str, required=True, help='Path to the visible spectrum video')
     parser.add_argument('--mwir_video_path', type=str, required=True, help='Path to the MWIR video')
     parser.add_argument('--output_video_path', type=str, required=True, help='Path to save the fused video')
+    parser.add_argument('--matching_dict_path', type=str, required=True, help='Path to json of rgb-thermal pairs')
 
     args = parser.parse_args()
 
-    prepare_fusion_dataset(args.visible_video_path, args.mwir_video_path, args.output_video_path)
+    prepare_fusion_dataset(args.visible_video_path, args.mwir_video_path, args.output_video_path, args.matching_dict_path)
 

@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path, matching_dict_path):
     # Get sorted filenames
-    with open(matching_dict) as json_file:
+    with open(matching_dict_path) as json_file:
        data = json.load(json_file)
        
     visible_files = list(data.keys())

@@ -8,7 +8,7 @@ from utils.video_processing import extract_frames, align_frames, compute_optical
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path, matching_dict_path):
+def prepare_fusion_dataset(visible_path, mwir_path, output_path, matching_dict_path, batch_size=10):
     # Get sorted filenames
     with open(matching_dict_path) as json_file:
        data = json.load(json_file)
@@ -16,7 +16,6 @@ def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_pat
     visible_files = list(data.keys())
     mwir_files = list(data.values())
     
-    os.makedirs(output_path, exist_ok=True)
     
     for i in range(0, len(visible_files), batch_size):
         batch_visible_files = visible_files[i:i + batch_size]

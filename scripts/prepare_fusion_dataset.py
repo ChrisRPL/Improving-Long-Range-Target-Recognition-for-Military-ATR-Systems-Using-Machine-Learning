@@ -2,37 +2,45 @@ import os
 import cv2
 import argparse
 import sys
+import json
 from pathlib import Path
 from utils.video_processing import extract_frames, align_frames, compute_optical_flow, wavelet_fusion, save_fused_frames
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_fusion_dataset(visible_video_path, mwir_video_path, output_video_path, matching_dict_path):
-    # Extract frames and filenames
-    visible_frames, visible_filenames = extract_frames(visible_video_path, matching_dict_path, "visible")
-    mwir_frames, mwir_filenames = extract_frames(mwir_video_path, matching_dict_path, "thermal")
+    # Get sorted filenames
+    with open(matching_dict) as json_file:
+       data = json.load(json_file)
+       
+    visible_files = list(data.keys())
+    mwir_files = list(data.values())
     
-    print(f"Visible frames: {len(visible_frames)}, MWIR frames: {len(mwir_frames)}")
+    os.makedirs(output_path, exist_ok=True)
     
-    # Ensure both lists have same length
-    min_frames = min(len(visible_frames), len(mwir_frames))
-    visible_frames = visible_frames[:min_frames]
-    mwir_frames = mwir_frames[:min_frames]
-    filenames = visible_filenames[:min_frames]
-    
-    # Get target size from visible frame
-    target_size = (visible_frames[0].shape[1], visible_frames[0].shape[0])
-    
-    # Process frames
-    fused_frames = []
-    for v_frame, m_frame in zip(visible_frames, mwir_frames):
-        # Resize MWIR to match visible
-        m_frame_resized = cv2.resize(m_frame, (v_frame.shape[1], v_frame.shape[0]))
-        # Fuse frames
-        fused_frame = wavelet_fusion(v_frame, m_frame_resized)
-        fused_frames.append(fused_frame)
-    
-    save_fused_frames(fused_frames, output_video_path, filenames)
+    for i in range(0, len(visible_files), batch_size):
+        batch_visible_files = visible_files[i:i + batch_size]
+        batch_mwir_files = mwir_files[i:i + batch_size]
+        
+        # Load batch
+        visible_frames = []
+        mwir_frames = []
+        for v_file, m_file in zip(batch_visible_files, batch_mwir_files):
+            v_frame = cv2.imread(os.path.join(visible_path, v_file))
+            m_frame = cv2.imread(os.path.join(mwir_path, m_file))
+            visible_frames.append(v_frame)
+            mwir_frames.append(m_frame)
+        
+        # Process batch
+        target_size = (visible_frames[0].shape[1], visible_frames[0].shape[0])
+        for v_frame, m_frame, filename in zip(visible_frames, mwir_frames, batch_visible_files):
+            m_frame_resized = cv2.resize(m_frame, target_size)
+            fused_frame = wavelet_fusion(v_frame, m_frame_resized)
+            cv2.imwrite(os.path.join(output_path, filename), fused_frame)
+        
+        # Clear memory
+        visible_frames = []
+        mwir_frames = []
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare Fusion Dataset")

@@ -9,37 +9,32 @@ from utils.video_processing import extract_frames, align_frames, compute_optical
 sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_fusion_dataset(visible_path, mwir_path, output_path, matching_dict_path, batch_size=10):
-    # Get sorted filenames
-    with open(matching_dict_path) as json_file:
+   with open(matching_dict_path) as json_file:
        data = json.load(json_file)
+   
+   visible_files = list(data.keys())
+   mwir_files = list(data.values())
+   os.makedirs(output_path, exist_ok=True)
+   
+   for i in range(0, len(visible_files), batch_size):
+       batch_visible_files = visible_files[i:i + batch_size]
+       batch_mwir_files = mwir_files[i:i + batch_size]
        
-    visible_files = list(data.keys())
-    mwir_files = list(data.values())
-    
-    
-    for i in range(0, len(visible_files), batch_size):
-        batch_visible_files = visible_files[i:i + batch_size]
-        batch_mwir_files = mwir_files[i:i + batch_size]
-        
-        # Load batch
-        visible_frames = []
-        mwir_frames = []
-        for v_file, m_file in zip(batch_visible_files, batch_mwir_files):
-            v_frame = cv2.imread(os.path.join(visible_path, v_file))
-            m_frame = cv2.imread(os.path.join(mwir_path, m_file))
-            visible_frames.append(v_frame)
-            mwir_frames.append(m_frame)
-        
-        # Process batch
-        target_size = (visible_frames[0].shape[1], visible_frames[0].shape[0])
-        for v_frame, m_frame, filename in zip(visible_frames, mwir_frames, batch_visible_files):
-            m_frame_resized = cv2.resize(m_frame, target_size)
-            fused_frame = wavelet_fusion(v_frame, m_frame_resized)
-            cv2.imwrite(os.path.join(output_path, filename), fused_frame)
-        
-        # Clear memory
-        visible_frames = []
-        mwir_frames = []
+       for v_file, m_file in zip(batch_visible_files, batch_mwir_files):
+           v_frame = cv2.imread(os.path.join(visible_path, v_file))
+           m_frame = cv2.imread(os.path.join(mwir_path, m_file))
+           
+           if v_frame is None or m_frame is None:
+               print(f"Error reading {v_file} or {m_file}")
+               continue
+           
+           m_frame = cv2.resize(m_frame, (v_frame.shape[1], v_frame.shape[0]))
+           
+           if len(m_frame.shape) == 2 or m_frame.shape[2] == 1:
+               m_frame = cv2.cvtColor(m_frame, cv2.COLOR_GRAY2BGR)
+           
+           fused_frame = wavelet_fusion(v_frame, m_frame)
+           cv2.imwrite(os.path.join(output_path, v_file), fused_frame)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare Fusion Dataset")

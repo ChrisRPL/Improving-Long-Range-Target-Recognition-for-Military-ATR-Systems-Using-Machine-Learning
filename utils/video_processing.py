@@ -19,6 +19,7 @@ def extract_frames(folder_path, matching_dict, image_type):
        filenames = list(data.values())
    
    for filename in filenames:
+       print(f"reading: {filename}")
        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
            image_path = os.path.join(folder_path, filename)
            frame = cv2.imread(image_path)

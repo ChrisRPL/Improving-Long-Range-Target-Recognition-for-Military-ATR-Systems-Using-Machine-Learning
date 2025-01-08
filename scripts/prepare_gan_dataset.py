@@ -82,7 +82,7 @@ def prepare_gan_dataset(
     with open(matching_dict_path) as f:
         matching_dict = json.load(f)
     
-    valid_filenames = set(matching_dict.values())
+    valid_filenames = set(matching_dict.keys())
     processed_count = 0
     
     print("Processing frames...")

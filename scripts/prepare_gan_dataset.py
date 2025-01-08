@@ -23,7 +23,7 @@ def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_re
             continue
            
         frame_idx = filenames.index(filename)
-        frame = cv2.imread(os.path.join(filename, video_path))
+        frame = cv2.imread(os.path.join(video_path, filename))
        
         for category_id, bbox in anns:
             x, y, w, h = [int(c) for c in bbox]

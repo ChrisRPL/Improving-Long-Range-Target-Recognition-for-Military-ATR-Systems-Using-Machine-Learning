@@ -10,7 +10,7 @@ from pathlib import Path
 from models.dsgan import DSGenerator, DSDiscriminator
 
 class DSGANDataset(Dataset):
-    def __init__(self, high_res_dir, low_res_dir, image_size=64):
+    def __init__(self, high_res_dir, low_res_dir, image_size=32):
         self.high_res_dir = Path(high_res_dir)
         self.low_res_dir = Path(low_res_dir)
         self.image_pairs = self._get_image_pairs()

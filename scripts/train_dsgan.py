@@ -2,104 +2,131 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
-from models.dsgan import DSGenerator, DSDiscriminator
-import argparse
+from torchvision import transforms
 from PIL import Image
+import argparse
+from pathlib import Path
+from models.dsgan import DSGenerator, DSDiscriminator
 
-class GanDataset(Dataset):
-    def __init__(self, high_res_dir, low_res_dir, transform=None):
-        self.high_res_paths = sorted([os.path.join(high_res_dir, f) for f in os.listdir(high_res_dir) if f.endswith('.png')])
-        self.low_res_paths = sorted([os.path.join(low_res_dir, f) for f in os.listdir(low_res_dir) if f.endswith('.png')])
-        self.transform = transform
+class DSGANDataset(Dataset):
+    def __init__(self, high_res_dir, low_res_dir, image_size=64):
+        self.high_res_dir = Path(high_res_dir)
+        self.low_res_dir = Path(low_res_dir)
+        self.image_pairs = self._get_image_pairs()
+        
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+    def _get_image_pairs(self):
+        high_res_files = set(f.name for f in self.high_res_dir.glob('*.png'))
+        low_res_files = set(f.name for f in self.low_res_dir.glob('*.png'))
+        return sorted(list(high_res_files & low_res_files))  # Get common files
 
     def __len__(self):
-        return len(self.high_res_paths)
+        return len(self.image_pairs)
 
     def __getitem__(self, idx):
-        high_res_image = Image.open(self.high_res_paths[idx]).convert('RGB')
-        low_res_image = Image.open(self.low_res_paths[idx]).convert('RGB')
+        image_name = self.image_pairs[idx]
+        high_res = Image.open(self.high_res_dir / image_name).convert('RGB')
+        low_res = Image.open(self.low_res_dir / image_name).convert('RGB')
+        
+        return self.transform(low_res), self.transform(high_res)
 
-        if self.transform:
-            high_res_image = self.transform(high_res_image)
-            low_res_image = self.transform(low_res_image)
+class DSGANTrainer:
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.setup_models()
+        self.setup_data()
+        self.setup_training()
 
-        return low_res_image, high_res_image
+    def setup_models(self):
+        self.netG = DSGenerator().to(self.device)
+        self.netD = DSDiscriminator().to(self.device)
 
-def train_dsgan(high_res_dir, low_res_dir, num_epochs=200, batch_size=64, latent_dim=100, lr=0.0002, beta1=0.5, output_model_dir='models'):
-    # Transformations
-    transform = transforms.Compose([
-        transforms.Resize(64),
-        transforms.CenterCrop(64),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
-    ])
+    def setup_data(self):
+        dataset = DSGANDataset(self.config.high_res_dir, self.config.low_res_dir)
+        self.dataloader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
 
-    # Dataset and DataLoader
-    dataset = GanDataset(high_res_dir, low_res_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    def setup_training(self):
+        self.criterion = nn.BCELoss()
+        self.optimG = optim.Adam(self.netG.parameters(), lr=self.config.lr, betas=(self.config.beta1, 0.999))
+        self.optimD = optim.Adam(self.netD.parameters(), lr=self.config.lr, betas=(self.config.beta1, 0.999))
 
-    # Initialize models
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    netG = DSGenerator().to(device)
-    netD = DSDiscriminator().to(device)
+    def train_epoch(self, epoch):
+        for i, (low_res, high_res) in enumerate(self.dataloader):
+            batch_size = low_res.size(0)
+            real_label = torch.ones(batch_size, device=self.device)
+            fake_label = torch.zeros(batch_size, device=self.device)
 
-    # Loss and optimizers
-    criterion = nn.BCELoss()
-    optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
-    optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+            # Update Discriminator
+            self.netD.zero_grad()
+            real_output = self.netD(high_res.to(self.device))
+            errD_real = self.criterion(real_output, real_label)
+            errD_real.backward()
 
-    # Training loop
-    for epoch in range(num_epochs):
-        for i, data in enumerate(dataloader):
-            low_res_images, high_res_images = data
-            low_res_images = low_res_images.to(device)
-            high_res_images = high_res_images.to(device)
-            b_size = low_res_images.size(0)
+            fake = self.netG(low_res.to(self.device))
+            fake_output = self.netD(fake.detach())
+            errD_fake = self.criterion(fake_output, fake_label)
+            errD_fake.backward()
             
-            # Create labels
-            real_labels = torch.ones(b_size).to(device)
-            fake_labels = torch.zeros(b_size).to(device)
-            
-            # Train Discriminator
-            netD.zero_grad()
-            output = netD(high_res_images).view(-1)
-            lossD_real = criterion(output, real_labels)
-            lossD_real.backward()
-            
-            fake_images = netG(low_res_images)
-            output = netD(fake_images.detach()).view(-1)
-            lossD_fake = criterion(output, fake_labels)
-            lossD_fake.backward()
-            optimizerD.step()
-            
-            # Train Generator
-            netG.zero_grad()
-            output = netD(fake_images).view(-1)
-            lossG = criterion(output, real_labels)
-            lossG.backward()
-            optimizerG.step()
-            
-            if i % 50 == 0:
-                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], LossD: {lossD_real.item() + lossD_fake.item()}, LossG: {lossG.item()}')
+            errD = errD_real + errD_fake
+            self.optimD.step()
 
-        # Save models
-        os.makedirs(output_model_dir, exist_ok=True)
-        torch.save(netG.state_dict(), f'{output_model_dir}/dsgan_generator_{epoch+1}.pth')
-        torch.save(netD.state_dict(), f'{output_model_dir}/dsgan_discriminator_{epoch+1}.pth')
+            # Update Generator
+            self.netG.zero_grad()
+            output = self.netD(fake)
+            errG = self.criterion(output, real_label)
+            errG.backward()
+            self.optimG.step()
+
+            if i % 100 == 0:
+                print(f'[{epoch}/{self.config.num_epochs}][{i}/{len(self.dataloader)}] '
+                      f'Loss_D: {errD.item():.4f} Loss_G: {errG.item():.4f}')
+
+    def save_checkpoint(self, epoch):
+        checkpoint_dir = Path(self.config.output_dir) / 'checkpoints'
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        torch.save({
+            'epoch': epoch,
+            'generator_state_dict': self.netG.state_dict(),
+            'discriminator_state_dict': self.netD.state_dict(),
+            'optimG_state_dict': self.optimG.state_dict(),
+            'optimD_state_dict': self.optimD.state_dict(),
+        }, checkpoint_dir / f'dsgan_checkpoint_epoch_{epoch}.pt')
+
+    def train(self):
+        for epoch in range(1, self.config.num_epochs + 1):
+            self.train_epoch(epoch)
+            if epoch % self.config.save_interval == 0:
+                self.save_checkpoint(epoch)
+
+def main():
+    parser = argparse.ArgumentParser(description="Train DS-GAN")
+    parser.add_argument('--high_res_dir', type=str, required=True)
+    parser.add_argument('--low_res_dir', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='output')
+    parser.add_argument('--num_epochs', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=0.0002)
+    parser.add_argument('--beta1', type=float, default=0.5)
+    parser.add_argument('--save_interval', type=int, default=10)
+    
+    config = parser.parse_args()
+    trainer = DSGANTrainer(config)
+    trainer.train()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DS-GAN")
-    parser.add_argument('--high_res_dir', type=str, required=True, help='Directory of high-resolution images')
-    parser.add_argument('--low_res_dir', type=str, required=True, help='Directory of low-resolution images')
-    parser.add_argument('--num_epochs', type=int, default=200, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
-    parser.add_argument('--latent_dim', type=int, default=100, help='Dimensionality of the latent vector')
-    parser.add_argument('--lr', type=float, default=0.0002, help='Learning rate for optimizers')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Beta1 for Adam optimizer')
-    parser.add_argument('--output_model_dir', type=str, default='models', help='Directory to save trained models')
-
-    args = parser.parse_args()
-    train_dsgan(args.high_res_dir, args.low_res_dir, args.num_epochs, args.batch_size, args.latent_dim, args.lr, args.beta1, args.output_model_dir)
-
+    main()

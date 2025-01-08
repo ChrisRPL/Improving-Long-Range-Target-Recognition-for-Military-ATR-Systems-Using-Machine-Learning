@@ -4,6 +4,7 @@ import json
 import argparse
 from pathlib import Path
 from typing import Tuple, Dict
+import numpy as np
 
 def load_coco_annotations(annotation_path: str) -> Tuple[Dict, Dict]:
     """Load COCO annotations and return image annotations and id mapping."""

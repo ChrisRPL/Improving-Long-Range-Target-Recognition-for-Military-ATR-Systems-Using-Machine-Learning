@@ -4,6 +4,7 @@ from utils.video_processing import extract_frames
 from utils.annotations import load_coco_annotations
 import sys
 from pathlib import Path
+import argparse
 sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_res_output_dir, matching_dict_path, crop_size=32):

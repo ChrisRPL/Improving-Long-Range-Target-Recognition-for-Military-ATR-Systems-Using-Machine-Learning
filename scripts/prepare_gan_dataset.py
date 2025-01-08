@@ -8,7 +8,6 @@ import argparse
 sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_res_output_dir, matching_dict_path, crop_size=32):
-    frames, filenames = extract_frames(video_path, matching_dict_path, "visible")
     annotations, id_to_filename = load_coco_annotations(annotation_path)
    
     for img_id, anns in annotations.items():
@@ -17,7 +16,7 @@ def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_re
             continue
            
         frame_idx = filenames.index(filename)
-        frame = frames[frame_idx]
+        frame = cv2.imread(os.path.join(filename, video_path))
        
         for category_id, bbox in anns:
             x, y, w, h = [int(c) for c in bbox]

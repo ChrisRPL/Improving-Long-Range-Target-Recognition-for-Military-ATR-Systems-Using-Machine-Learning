@@ -18,6 +18,11 @@ class DSGANDataset(Dataset):
         self.low_res_dir = Path(low_res_dir)
         self.image_pairs = self._get_image_pairs()
         
+        if len(self.image_pairs) == 0:
+            raise ValueError(f"No matching image pairs found in {high_res_dir} and {low_res_dir}")
+            
+        print(f"Found {len(self.image_pairs)} image pairs")
+        
         self.transform = transforms.Compose([
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
@@ -26,19 +31,41 @@ class DSGANDataset(Dataset):
         ])
 
     def _get_image_pairs(self):
-        high_res_files = set(f.name for f in self.high_res_dir.glob('*.png'))
-        low_res_files = set(f.name for f in self.low_res_dir.glob('*.png'))
-        return sorted(list(high_res_files & low_res_files))  # Get common files
+        # Get all files from both directories with .jpg extension
+        high_res_files = set(f.stem for f in self.high_res_dir.glob('*.jpg'))
+        low_res_files = set(f.stem for f in self.low_res_dir.glob('*.jpg'))
+        
+        # Debug prints
+        print(f"Found {len(high_res_files)} high-res images")
+        print(f"Found {len(low_res_files)} low-res images")
+        
+        # Get common files (without extension)
+        common_files = sorted(list(high_res_files & low_res_files))
+        
+        # Convert back to full filenames with jpg extension
+        return [f"{name}.jpg" for name in common_files]
 
     def __len__(self):
         return len(self.image_pairs)
 
     def __getitem__(self, idx):
-        image_name = self.image_pairs[idx]
-        high_res = Image.open(self.high_res_dir / image_name).convert('RGB')
-        low_res = Image.open(self.low_res_dir / image_name).convert('RGB')
-        
-        return self.transform(low_res), self.transform(high_res)
+        try:
+            image_name = self.image_pairs[idx]
+            high_res_path = self.high_res_dir / image_name
+            low_res_path = self.low_res_dir / image_name
+            
+            if not high_res_path.exists():
+                raise FileNotFoundError(f"High-res image not found: {high_res_path}")
+            if not low_res_path.exists():
+                raise FileNotFoundError(f"Low-res image not found: {low_res_path}")
+                
+            high_res = Image.open(high_res_path).convert('RGB')
+            low_res = Image.open(low_res_path).convert('RGB')
+            
+            return self.transform(low_res), self.transform(high_res)
+        except Exception as e:
+            print(f"Error loading image pair {image_name}: {str(e)}")
+            raise
 
 class DSGANTrainer:
     def __init__(self, config):

@@ -1,28 +1,41 @@
 import os
 import cv2
-from utils.video_processing import extract_frames
-from utils.annotations import load_coco_annotations
-import sys
-from pathlib import Path
-import argparse
 import json
-sys.path.append(str(Path(__file__).parent.parent))
+import argparse
+from pathlib import Path
+from typing import Tuple, Dict
 
-def crop_square(frame, x, y, w, h):
-    # Find the center of the detected object
+def load_coco_annotations(annotation_path: str) -> Tuple[Dict, Dict]:
+    """Load COCO annotations and return image annotations and id mapping."""
+    with open(annotation_path) as f:
+        coco_data = json.load(f)
+    
+    # Create image id to filename mapping
+    id_to_filename = {img['id']: img['file_name'] for img in coco_data['images']}
+    
+    # Group annotations by image id
+    annotations = {}
+    for ann in coco_data['annotations']:
+        img_id = ann['image_id']
+        if img_id not in annotations:
+            annotations[img_id] = []
+        annotations[img_id].append((ann['category_id'], ann['bbox']))
+    
+    return annotations, id_to_filename
+
+def crop_square(frame, x: int, y: int, w: int, h: int) -> np.ndarray:
+    """Crop a square region around object, maintaining aspect ratio."""
     center_x = x + w//2
     center_y = y + h//2
-    
-    # Use the larger dimension for the square
     size = max(w, h)
     
-    # Calculate square boundaries keeping the object centered
+    # Calculate square boundaries
     x1 = max(0, center_x - size//2)
     y1 = max(0, center_y - size//2)
     x2 = min(frame.shape[1], x1 + size)
     y2 = min(frame.shape[0], y1 + size)
     
-    # Adjust if square goes beyond frame boundaries
+    # Adjust for frame boundaries
     if x1 < 0:
         x2 = min(frame.shape[1], size)
         x1 = 0
@@ -30,64 +43,106 @@ def crop_square(frame, x, y, w, h):
         y2 = min(frame.shape[0], size)
         y1 = 0
     
-    # Ensure we get a square crop even at image boundaries
+    # Ensure square crop
     actual_size = min(x2 - x1, y2 - y1)
     x2 = x1 + actual_size
     y2 = y1 + actual_size
     
     return frame[int(y1):int(y2), int(x1):int(x2)]
 
-def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_res_output_dir, matching_dict_path, crop_size=64):
+def prepare_gan_dataset(
+    frames_dir: str,
+    annotation_path: str,
+    output_dir: str,
+    matching_dict_path: str,
+    target_size: int = 32,
+    min_size: int = 96  # Only use objects larger than this
+) -> None:
+    """
+    Prepare dataset for GAN training by creating high-res and low-res pairs.
+    
+    Args:
+        frames_dir: Directory containing input frames
+        annotation_path: Path to COCO format annotations
+        output_dir: Base directory for output
+        matching_dict_path: Path to frame matching dictionary
+        target_size: Size of low-res output (default: 32 for COCO small objects)
+        min_size: Minimum size of source objects to use (default: 96)
+    """
+    # Create output directories
+    output_dir = Path(output_dir)
+    high_res_dir = output_dir / 'high_res'
+    low_res_dir = output_dir / 'low_res'
+    high_res_dir.mkdir(parents=True, exist_ok=True)
+    low_res_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load annotations and matching dictionary
     annotations, id_to_filename = load_coco_annotations(annotation_path)
-    with open(matching_dict_path) as json_file:
-        data = json.load(json_file)
+    with open(matching_dict_path) as f:
+        matching_dict = json.load(f)
     
-    filenames = list(data.values())
-    print("preparing dataset")
+    valid_filenames = set(matching_dict.values())
+    processed_count = 0
     
-   
+    print("Processing frames...")
     for img_id, anns in annotations.items():
         filename = id_to_filename[img_id].replace("data/", "")
-        print(filename)
-        if filename not in filenames:
+        if filename not in valid_filenames:
             continue
-        
-        frame_idx = filenames.index(filename)
-        frame = cv2.imread(os.path.join(video_path, filename))
-        
+            
+        frame_path = Path(frames_dir) / filename
+        frame = cv2.imread(str(frame_path))
         if frame is None:
             print(f"Warning: Could not read frame {filename}")
             continue
-        
-        for category_id, bbox in anns:
-            x, y, w, h = [int(c) for c in bbox]
             
+        for category_id, bbox in anns:
+            x, y, w, h = map(int, bbox)
+            
+            # Skip small objects
+            if w * h < min_size * min_size:
+                continue
+                
             # Get square crop
             crop = crop_square(frame, x, y, w, h)
-            
-            # Skip if crop is empty
             if crop.size == 0:
-                print(f"Warning: Empty crop for {filename}_{category_id}")
                 continue
+                
+            # Create high-res and low-res versions
+            low_res = cv2.resize(crop, (target_size, target_size))
             
-            # Create low-res version
-            crop_resized = cv2.resize(crop, (crop_size, crop_size))
+            # Save images
+            base_name = f'{filename.stem}_{category_id}{filename.suffix}'
+            cv2.imwrite(str(low_res_dir / base_name), low_res)
+            cv2.imwrite(str(high_res_dir / base_name), crop)
             
-            # Save both versions
-            low_res_output_path = os.path.join(low_res_output_dir, f'{filename}_{category_id}.png')
-            high_res_output_path = os.path.join(high_res_output_dir, f'{filename}_{category_id}.png')
-            
-            cv2.imwrite(low_res_output_path, crop_resized)
-            cv2.imwrite(high_res_output_path, crop)
+            processed_count += 1
+            if processed_count % 100 == 0:
+                print(f"Processed {processed_count} objects")
+    
+    print(f"Dataset creation complete. Total objects processed: {processed_count}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare Fusion Dataset")
-    parser.add_argument('--video_frames_path', type=str, required=True, help='Path to the video frames')
-    parser.add_argument('--annotation_path', type=str, required=True, help='Path to coco json annotations')
-    parser.add_argument('--low_res_output_dir', type=str, required=True, help='Path to low res output images')
-    parser.add_argument('--high_res_output_dir', type=str, required=True, help='Path to high res output images')
-    parser.add_argument('--matching_dict_path', type=str, required=True, help='Path to json of rgb-thermal pairs')
-
+    parser = argparse.ArgumentParser(description="Prepare GAN Training Dataset")
+    parser.add_argument('--frames_dir', type=str, required=True,
+                      help='Directory containing input frames')
+    parser.add_argument('--annotation_path', type=str, required=True,
+                      help='Path to COCO format annotations')
+    parser.add_argument('--output_dir', type=str, required=True,
+                      help='Base directory for output (will create high_res and low_res subdirs)')
+    parser.add_argument('--matching_dict_path', type=str, required=True,
+                      help='Path to frame matching dictionary')
+    parser.add_argument('--target_size', type=int, default=32,
+                      help='Size of low-res output (default: 32)')
+    parser.add_argument('--min_size', type=int, default=96,
+                      help='Minimum size of source objects to use (default: 96)')
+    
     args = parser.parse_args()
-
-    prepare_gan_dataset(args.video_frames_path, args.annotation_path, args.low_res_output_dir, args.high_res_output_dir, args.matching_dict_path)
+    prepare_gan_dataset(
+        args.frames_dir,
+        args.annotation_path,
+        args.output_dir,
+        args.matching_dict_path,
+        args.target_size,
+        args.min_size
+    )

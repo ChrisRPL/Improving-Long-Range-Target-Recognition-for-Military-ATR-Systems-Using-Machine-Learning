@@ -8,6 +8,9 @@ from PIL import Image
 import argparse
 from pathlib import Path
 from models.dsgan import DSGenerator, DSDiscriminator
+import sys
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 class DSGANDataset(Dataset):
     def __init__(self, high_res_dir, low_res_dir, image_size=32):

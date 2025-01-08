@@ -3,8 +3,8 @@ import cv2
 import json
 import argparse
 from pathlib import Path
-from typing import Tuple, Dict
 import numpy as np
+from typing import Tuple, Dict
 
 def load_coco_annotations(annotation_path: str) -> Tuple[Dict, Dict]:
     """Load COCO annotations and return image annotations and id mapping."""
@@ -57,18 +57,10 @@ def prepare_gan_dataset(
     output_dir: str,
     matching_dict_path: str,
     target_size: int = 32,
-    min_size: int = 96  # Only use objects larger than this
+    min_size: int = 96
 ) -> None:
     """
     Prepare dataset for GAN training by creating high-res and low-res pairs.
-    
-    Args:
-        frames_dir: Directory containing input frames
-        annotation_path: Path to COCO format annotations
-        output_dir: Base directory for output
-        matching_dict_path: Path to frame matching dictionary
-        target_size: Size of low-res output (default: 32 for COCO small objects)
-        min_size: Minimum size of source objects to use (default: 96)
     """
     # Create output directories
     output_dir = Path(output_dir)
@@ -82,7 +74,7 @@ def prepare_gan_dataset(
     with open(matching_dict_path) as f:
         matching_dict = json.load(f)
     
-    valid_filenames = set(matching_dict.keys())
+    valid_filenames = set(matching_dict.values())
     processed_count = 0
     
     print("Processing frames...")
@@ -112,8 +104,10 @@ def prepare_gan_dataset(
             # Create high-res and low-res versions
             low_res = cv2.resize(crop, (target_size, target_size))
             
-            # Save images
-            base_name = f'{filename.stem}_{category_id}{filename.suffix}'
+            # Fix: Convert filename to Path before accessing stem and suffix
+            path_obj = Path(filename)
+            base_name = f'{path_obj.stem}_{category_id}{path_obj.suffix}'
+            
             cv2.imwrite(str(low_res_dir / base_name), low_res)
             cv2.imwrite(str(high_res_dir / base_name), crop)
             

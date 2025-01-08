@@ -15,9 +15,10 @@ def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_re
        data = json.load(json_file)
     
     filenames = list(data.keys())
-   
+    print("preparing dataset")
     for img_id, anns in annotations.items():
         filename = id_to_filename[img_id]
+        print(filename)
         if filename not in filenames:
             continue
            

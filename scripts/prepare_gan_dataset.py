@@ -5,10 +5,16 @@ from utils.annotations import load_coco_annotations
 import sys
 from pathlib import Path
 import argparse
+import json
 sys.path.append(str(Path(__file__).parent.parent))
 
 def prepare_gan_dataset(video_path, annotation_path, low_res_output_dir, high_res_output_dir, matching_dict_path, crop_size=32):
     annotations, id_to_filename = load_coco_annotations(annotation_path)
+
+    with open(matching_dict_path) as json_file:
+       data = json.load(json_file)
+    
+    filenames = list(data.keys())
    
     for img_id, anns in annotations.items():
         filename = id_to_filename[img_id]

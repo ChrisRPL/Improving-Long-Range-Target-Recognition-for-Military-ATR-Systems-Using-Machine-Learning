@@ -263,7 +263,7 @@ def inpaint_dataset_with_gan(args):
             # Filter large objects
             large_objects = [
                 ann for ann in image_annotations 
-                if ann['bbox'][2] * ann['bbox'][3] >= 96 * 96  # min_size check
+                if ann['bbox'][2] * ann['bbox'][3] >= 32 * 32  # min_size check
             ]
             
             if large_objects:

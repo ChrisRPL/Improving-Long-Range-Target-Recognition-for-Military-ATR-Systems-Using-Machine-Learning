@@ -64,6 +64,60 @@ class SmallObjectInpainter:
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
+    
+    def process_image(self, frame, large_objects, image_info):
+        """Process a single image."""
+        height, width = frame.shape[:2]
+        new_annotations = []
+        processed = False
+    
+        print(f"\nProcessing image of size {width}x{height}")
+        print(f"Number of large objects to process: {len(large_objects)}")
+    
+        for ann in large_objects:
+            bbox = ann['bbox']
+            x, y, w, h = [int(v) for v in bbox]
+        
+            print(f"Processing object: x={x}, y={y}, w={w}, h={h}")
+        
+            # Extract large object
+            large_object = frame[y:y+h, x:x+w]
+            if large_object.size == 0:
+                print("Skipping: empty crop")
+                continue
+            
+            # Generate smaller version
+            print("Generating smaller version...")
+            small_object = self.generate_small_object(large_object)
+        
+            # Calculate new size and position
+            new_w = int(w * 0.5)
+            new_h = int(h * 0.5)
+        
+            offset_x = int((np.random.random() - 0.5) * w * 0.2)
+            offset_y = int((np.random.random() - 0.5) * h * 0.2)
+        
+            new_x = max(0, x + offset_x)
+            new_y = max(0, y + offset_y)
+            new_x = min(new_x, width - new_w)
+            new_y = min(new_y, height - new_h)
+        
+            print(f"New position: x={new_x}, y={new_y}, w={new_w}, h={new_h}")
+        
+            # Resize and place small object
+            small_object_resized = cv2.resize(small_object, (new_w, new_h))
+            frame[new_y:new_y+new_h, new_x:new_x+new_w] = small_object_resized
+            processed = True
+        
+            # Create new annotation
+            new_ann = ann.copy()
+            new_ann['id'] = len(new_annotations) + max([a['id'] for a in large_objects]) + 1
+            new_ann['bbox'] = [float(new_x), float(new_y), float(new_w), float(new_h)]
+            new_ann['area'] = float(new_w * new_h)
+            new_annotations.append(new_ann)
+            print(f"Added new annotation with id {new_ann['id']}")
+    
+        return frame if processed else None, new_annotations
 
     def generate_small_object(self, large_object):
         if len(large_object.shape) == 2:
@@ -160,10 +214,16 @@ class SmallObjectInpainter:
 def inpaint_dataset_with_gan(args):
     generator, device = load_generator(args.model_path)
     inpainter = SmallObjectInpainter(generator, device)
+    
+    print("Loading COCO annotations...")
     coco_data = load_coco_annotations(args.annotation_path)
+    print(f"Loaded {len(coco_data['images'])} images and {len(coco_data['annotations'])} annotations")
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    output_annotation_dir = Path(args.output_annotation_path).parent
+    output_annotation_dir.mkdir(parents=True, exist_ok=True)
     
     new_coco_data = {
         'images': coco_data['images'].copy(),
@@ -171,50 +231,86 @@ def inpaint_dataset_with_gan(args):
         'annotations': coco_data['annotations'].copy()
     }
     
-    # Group images by sequence (assuming sequential naming or timestamps)
-    image_sequences = {}
-    for img_info in coco_data['images']:
-        seq_key = img_info['file_name'].split('_')[0]  # Adjust splitting logic based on your naming
-        if seq_key not in image_sequences:
-            image_sequences[seq_key] = []
-        image_sequences[seq_key].append(img_info)
+    # Counter for progress tracking
+    total_images = len(coco_data['images'])
+    processed_count = 0
+    large_objects_found = 0
+    total_new_annotations = 0
     
-    # Process each sequence
-    for seq_key, seq_images in image_sequences.items():
-        frames = []
-        seq_annotations = []
-        
-        # Load frames and annotations
-        for img_info in sorted(seq_images, key=lambda x: x['file_name']):
+    print("\nProcessing images...")
+    for img_info in coco_data['images']:
+        processed_count += 1
+        if processed_count % 10 == 0:
+            print(f"Processing image {processed_count}/{total_images}")
+            
+        try:
             image_path = Path(args.image_dir) / img_info['file_name']
-            frame = cv2.imread(str(image_path))
-            if frame is None:
-                print(f"Could not read image: {image_path}")
+            if not image_path.exists():
+                print(f"Warning: Image not found: {image_path}")
                 continue
                 
-            frames.append(frame)
-            seq_annotations.extend([
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                print(f"Warning: Could not read image: {image_path}")
+                continue
+            
+            # Get annotations for this image
+            image_annotations = [
                 ann for ann in coco_data['annotations'] 
                 if ann['image_id'] == img_info['id']
-            ])
-        
-        # Process sequence
-        if frames:
-            processed_frames, new_anns = inpainter.process_video_sequence(
-                frames, seq_annotations, seq_images[0]
-            )
+            ]
             
-            # Save processed frames
-            for frame_idx, (frame, img_info) in enumerate(zip(processed_frames, seq_images)):
-                output_path = output_dir / img_info['file_name']
-                cv2.imwrite(str(output_path), frame)
+            # Filter large objects
+            large_objects = [
+                ann for ann in image_annotations 
+                if ann['bbox'][2] * ann['bbox'][3] >= 96 * 96  # min_size check
+            ]
             
-            # Add new annotations
-            new_coco_data['annotations'].extend(new_anns)
+            if large_objects:
+                large_objects_found += 1
+                print(f"\nFound {len(large_objects)} large objects in {img_info['file_name']}")
+                
+                # Process image
+                processed_frame, new_anns = inpainter.process_image(
+                    frame, 
+                    large_objects,
+                    img_info
+                )
+                
+                if processed_frame is not None and len(new_anns) > 0:
+                    # Save processed image
+                    output_path = output_dir / img_info['file_name']
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save the image
+                    success = cv2.imwrite(str(output_path), processed_frame)
+                    if success:
+                        print(f"Saved processed image to {output_path}")
+                        new_coco_data['annotations'].extend(new_anns)
+                        total_new_annotations += len(new_anns)
+                    else:
+                        print(f"Failed to save image to {output_path}")
+            
+        except Exception as e:
+            print(f"Error processing image {img_info['file_name']}: {str(e)}")
+            continue
+    
+    print("\nProcessing summary:")
+    print(f"Total images processed: {processed_count}")
+    print(f"Images with large objects: {large_objects_found}")
+    print(f"New annotations created: {total_new_annotations}")
     
     # Save updated annotations
-    with open(args.output_annotation_path, 'w') as f:
+    print("\nSaving annotations...")
+    output_annotation_path = Path(args.output_annotation_path)
+    if output_annotation_path.suffix != '.json':
+        output_annotation_path = output_annotation_path / 'annotations.json'
+    
+    with open(output_annotation_path, 'w') as f:
         json.dump(new_coco_data, f)
+    
+    print(f"Annotations saved to {output_annotation_path}")
+    print("Processing complete!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inpaint Dataset with DS-GAN")

@@ -8,6 +8,9 @@ from models.dsgan import DSGenerator
 from pathlib import Path
 import argparse
 from PIL import Image
+import sys
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 def calculate_optical_flow(prev_frame, curr_frame):
     """Calculate optical flow between two frames using Farneback method."""

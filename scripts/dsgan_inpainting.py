@@ -26,7 +26,27 @@ def calculate_optical_flow(prev_frame, curr_frame):
 def load_generator(model_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = DSGenerator().to(device)
-    generator.load_state_dict(torch.load(model_path))
+    
+    try:
+        # Load with warning about pickle security
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        
+        if isinstance(checkpoint, dict):
+            if 'generator_state_dict' in checkpoint:
+                generator.load_state_dict(checkpoint['generator_state_dict'])
+            elif 'state_dict' in checkpoint:
+                generator.load_state_dict(checkpoint['state_dict'])
+            else:
+                print("Checkpoint structure:", checkpoint.keys())
+                raise ValueError("Unexpected checkpoint structure")
+        else:
+            generator.load_state_dict(checkpoint)
+            
+        print("Successfully loaded generator model")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
+        
     generator.eval()
     return generator, device
 

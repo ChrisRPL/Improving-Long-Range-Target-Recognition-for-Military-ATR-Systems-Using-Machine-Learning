@@ -1,117 +1,119 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from models.detection_model import create_model
-from utils.annotations import load_yolo_annotations
-import os
-import cv2
-import numpy as np
-from torchvision.transforms import functional as F
-import argparse
+from torch.utils.data import DataLoader
+from pathlib import Path
+import yaml
+from tqdm import tqdm
+import sys
+from models.detection_dataset import EnhancedObjectDetectionDataset
+from models.detection_model import EnhancedDetectionModel
 
-class YoloDataset(Dataset):
-    def __init__(self, image_paths, flow_paths, annotations, transform=None):
-        self.image_paths = image_paths
-        self.flow_paths = flow_paths
-        self.annotations = annotations
-        self.transform = transform
+sys.path.append(str(Path(__file__).parent.parent))
 
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        image = cv2.imread(self.image_paths[idx])
-        flow = np.load(self.flow_paths[idx])
-        bboxes = self.annotations[idx]['boxes']
-        labels = self.annotations[idx]['labels']
-
-        if self.transform:
-            augmented = self.transform(image=image, masks=[flow])
-            image = augmented['image']
-            flow = augmented['masks'][0]
-
-        image = torch.from_numpy(image).permute(2, 0, 1).float()
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
-        bboxes = torch.tensor(bboxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.long)
-
-        target = {'boxes': bboxes, 'labels': labels}
-
-        return image, flow, target
-
-def yolo_loss(bboxes_pred, class_logits_pred, bboxes_true, class_labels_true):
-    # Calculate IoU
-    iou = box_iou(bboxes_pred, bboxes_true)
-
-    # Loss functions
-    loss_bbox = 1 - iou.mean()
-    loss_class = F.cross_entropy(class_logits_pred, class_labels_true)
-
-    return loss_bbox + loss_class
-
-def train_model(model, dataloader, optimizer, device, num_epochs=25):
-    model.to(device)
-    model.train()
-
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        for images, flows, targets in dataloader:
-            images = images.to(device)
-            flows = flows.to(device)
-            bboxes_true = targets['boxes'].to(device)
-            class_labels_true = targets['labels'].to(device)
-
+def train_model(model, train_loader, val_loader, config):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=config['lr'],
+        epochs=config['epochs'],
+        steps_per_epoch=len(train_loader)
+    )
+    
+    # Training loop
+    best_map = 0
+    for epoch in range(config['epochs']):
+        model.train()
+        total_loss = 0
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config["epochs"]}')
+        
+        for batch in progress_bar:
+            images = batch['image'].to(device)
+            flows = batch['flow'].to(device)
+            labels = batch['labels'].to(device)
+            
+            # Forward pass
+            pred_boxes, pred_logits = model(images, flows)
+            loss = model.loss_fn(pred_boxes, pred_logits, labels[:, 1:], labels[:, 0])
+            
+            # Backward pass
             optimizer.zero_grad()
-            bboxes_pred, class_logits_pred = model(images, flows)
-
-            # Compute loss
-            loss = yolo_loss(bboxes_pred, class_logits_pred, bboxes_true, class_labels_true)
             loss.backward()
             optimizer.step()
+            scheduler.step()
+            
+            # Update metrics
+            model.update_metrics(pred_boxes, pred_logits, labels)
+            total_loss += loss.item()
+            
+            # Update progress bar
+            progress_bar.set_postfix({'loss': loss.item()})
+        
+        # Evaluate
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch['image'].to(device)
+                flows = batch['flow'].to(device)
+                labels = batch['labels'].to(device)
+                
+                pred_boxes, pred_logits = model(images, flows)
+                loss = model.loss_fn(pred_boxes, pred_logits, labels[:, 1:], labels[:, 0])
+                val_loss += loss.item()
+                
+                model.update_metrics(pred_boxes, pred_logits, labels)
+        
+        # Get metrics
+        metrics = model.get_metrics()
+        print(f'Epoch {epoch+1} metrics:')
+        for k, v in metrics.items():
+            print(f'{k}: {v:.4f}')
+        
+        # Save best model
+        if metrics['mAP50'] > best_map:
+            best_map = metrics['mAP50']
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'metrics': metrics,
+            }, 'best_model.pt')
 
-            running_loss += loss.item() * images.size(0)
-
-        epoch_loss = running_loss / len(dataloader.dataset)
-        print(f'Epoch {epoch}/{num_epochs} Loss: {epoch_loss:.4f}')
-
-    print('Training complete')
-    return model
-
-def load_dataset(dataset_type):
-    if dataset_type == 'mwir':
-        image_dir = 'data/mwir_videos'
-    elif dataset_type == 'visible':
-        image_dir = 'data/visible_videos'
-    elif dataset_type == 'fused':
-        image_dir = 'data/fused_videos'
-    elif dataset_type == 'dsgan':
-        image_dir = 'data/dsgan_videos'
-    else:
-        raise ValueError("Invalid dataset type")
-
-    annotation_dir = 'data/annotations'
-    image_paths = [os.path.join(image_dir, img) for img in sorted(os.listdir(image_dir))]
-    flow_paths = [os.path.join(image_dir, f.replace('.jpg', '.npy')) for f in sorted(os.listdir(image_dir))]
-    annotations = [load_yolo_annotations(os.path.join(annotation_dir, ann)) for ann in sorted(os.listdir(annotation_dir))]
+def main():
+    # Load config
+    with open('data.yaml', 'r') as f:
+        config = yaml.safe_load(f)
     
-    dataset = YoloDataset(image_paths, flow_paths, annotations)
-    return DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train Detection Model')
-    parser.add_argument('--dataset_type', type=str, required=True, help='Type of dataset: mwir, visible, fused, dsgan')
-    parser.add_argument('--num_classes', type=int, required=True, help='Number of classes for the model')
-    args = parser.parse_args()
-
-    dataloader = load_dataset(args.dataset_type)
+    # Create datasets
+    train_dataset = EnhancedObjectDetectionDataset(
+        Path(config['path']), 'train'
+    )
+    val_dataset = EnhancedObjectDetectionDataset(
+        Path(config['path']), 'valid'
+    )
     
-    model = create_model(num_classes=args.num_classes)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers']
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers']
+    )
     
-    trained_model = train_model(model, dataloader, optimizer, device, num_epochs=25)
+    # Create model
+    model = EnhancedDetectionModel(num_classes=config['nc'])
     
-    # Save trained model
-    torch.save(trained_model.state_dict(), f'outputs/enhanced_detection_model_{args.dataset_type}.pth')
+    # Train
+    train_model(model, train_loader, val_loader, config)
 
+if __name__ == '__main__':
+    main()

@@ -4,6 +4,11 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 import argparse
+import sys
+from models.detection_model import EnhancedDetectionModel
+from models.detection_dataset import EnhancedObjectDetectionDataset
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 def load_yaml(yaml_path):
     """Load YAML configuration file and resolve paths."""

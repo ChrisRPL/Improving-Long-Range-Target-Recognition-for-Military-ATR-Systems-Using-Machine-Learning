@@ -199,6 +199,8 @@ def main():
                       help='Number of epochs')
     parser.add_argument('--output-dir', type=str, default='runs/train',
                       help='Output directory')
+    parser.add_argument('--num-workers', type=int, default=2,
+                      help='Number of dataloader workers')
     
     args = parser.parse_args()
     

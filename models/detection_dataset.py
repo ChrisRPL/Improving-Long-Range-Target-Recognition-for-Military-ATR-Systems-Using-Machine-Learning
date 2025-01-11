@@ -77,28 +77,31 @@ class EnhancedObjectDetectionDataset(Dataset):
             'img_path': str(img_path)
         }
 
-def collate_fn(batch: List[Dict]) -> Dict:
+def collate_fn(batch):
     """Custom collate function to handle variable number of labels."""
     images = torch.stack([item['image'] for item in batch])
     flows = torch.stack([item['flow'] for item in batch])
     
-    # Pad labels to same length
+    # Find max number of labels in batch
     max_labels = max(item['labels'].shape[0] for item in batch)
-    labels = []
-    for item in batch:
-        if item['labels'].shape[0] == 0:
-            padded = torch.zeros((max_labels, 5))
-        else:
-            padded = torch.zeros((max_labels, 5))
-            padded[:item['labels'].shape[0]] = item['labels']
-        labels.append(padded)
     
-    labels = torch.stack(labels)
-    paths = [item['img_path'] for item in batch]
+    # Pad labels to max length
+    padded_labels = []
+    for item in batch:
+        num_labels = item['labels'].shape[0]
+        if num_labels == 0:
+            # Handle empty labels
+            padding = torch.full((max_labels, 5), -1)
+            padded_labels.append(padding)
+        else:
+            padding = torch.full((max_labels - num_labels, 5), -1)
+            padded = torch.cat([item['labels'], padding], dim=0)
+            padded_labels.append(padded)
+    
+    labels = torch.stack(padded_labels)
     
     return {
         'image': images,
         'flow': flows,
         'labels': labels,
-        'img_path': paths
     }

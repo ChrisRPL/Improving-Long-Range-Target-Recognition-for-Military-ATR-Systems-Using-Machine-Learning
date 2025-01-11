@@ -7,6 +7,9 @@ import argparse
 import sys
 from models.detection_model import EnhancedDetectionModel
 from models.detection_dataset import EnhancedObjectDetectionDataset, collate_fn
+from torch.utils.data import Dataset, DataLoader
+import torch.amp as amp  # Updated import
+from scipy.optimize import linear_sum_assignment  # Add this import
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -79,8 +82,8 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                 loss = model.loss_fn(
                     pred_boxes,
                     pred_logits,
-                    labels[valid_labels][:, 1:],
-                    labels[valid_labels][:, 0].long()
+                    labels[..., 1:],  # bbox coordinates
+                    labels[..., 0]    # class labels
                 )
             
             # Backward pass with gradient scaling

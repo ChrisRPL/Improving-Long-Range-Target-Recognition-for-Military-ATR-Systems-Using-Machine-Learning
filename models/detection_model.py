@@ -3,6 +3,9 @@ import torch.nn as nn
 import torchvision.models as models
 from torchmetrics.detection import MeanAveragePrecision
 import math
+from torch.utils.data import Dataset, DataLoader
+import torch.amp as amp  # Updated import
+from scipy.optimize import linear_sum_assignment  # Add this import
 
 class Backbone(nn.Module):
     def __init__(self, input_channels=3):
@@ -144,26 +147,50 @@ class EnhancedDetectionModel(nn.Module):
         """
         Calculate loss for training.
         Args:
-            pred_boxes: Predicted boxes [B*num_queries, 4]
-            pred_logits: Predicted class logits [B*num_queries, num_classes]
-            target_boxes: Ground truth boxes [N, 4]
-            target_labels: Ground truth labels [N]
+            pred_boxes: Predicted boxes [B, num_queries, 4]
+            pred_logits: Predicted class logits [B, num_queries, num_classes]
+            target_boxes: Ground truth boxes [B, max_objects, 4]
+            target_labels: Ground truth labels [B, max_objects]
         Returns:
             total_loss: Combined loss for training
         """
-        # Calculate giou loss for boxes
-        giou_loss = 1 - torch.diag(box_iou(
-            pred_boxes,
-            target_boxes,
-            box_format='cxcywh'
-        )).mean()
+        # Flatten predictions for loss calculation
+        pred_boxes = pred_boxes.view(-1, 4)
+        pred_logits = pred_logits.view(-1, pred_logits.size(-1))
         
-        # Calculate classification loss
-        cls_loss = nn.functional.cross_entropy(pred_logits, target_labels)
+        # Flatten targets and remove padding
+        valid_mask = target_labels.ne(-1)  # Identify valid targets
+        target_boxes = target_boxes[valid_mask]
+        target_labels = target_labels[valid_mask]
         
-        # Combine losses
+        if len(target_boxes) == 0:
+            # Handle case with no valid targets
+            dummy_box_target = torch.zeros_like(pred_boxes[0:1])
+            giou_loss = 1 - box_iou(pred_boxes[0:1], dummy_box_target)[0, 0]
+            cls_loss = pred_logits.sum() * 0  # zero loss for classification
+        else:
+            # Calculate matching cost between predictions and targets
+            cost_giou = -box_iou(pred_boxes, target_boxes)
+            cost_cls = -pred_logits[:, target_labels.long()]
+            
+            # Hungarian matching
+            cost_matrix = cost_giou + cost_cls
+            indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
+            indices = [torch.as_tensor(i, dtype=torch.int64) for i in indices]
+            
+            # Calculate losses using matched pairs
+            giou_loss = 1 - box_iou(
+                pred_boxes[indices[0]], 
+                target_boxes[indices[1]]
+            ).diag().mean()
+            
+            cls_loss = F.cross_entropy(
+                pred_logits[indices[0]], 
+                target_labels[indices[1]].long()
+            )
+        
+        # Combine losses with weighting
         total_loss = giou_loss + cls_loss
-        
         return total_loss
     
     def update_metrics(self, pred_boxes, pred_logits, targets):

@@ -76,7 +76,7 @@ class EnhancedDetectionModel(nn.Module):
             box_format='cxcywh',  # YOLOv8 format
             iou_thresholds=[0.5],
             rec_thresholds=None,
-            max_detection_thresholds=[100]
+            max_detection_thresholds=[1, 10, 100]
         )
         
     def forward(self, images, flows):

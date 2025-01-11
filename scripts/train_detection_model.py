@@ -229,9 +229,9 @@ def main():
                       help='Path to data.yaml file')
     parser.add_argument('--weights', type=str, default=None,
                       help='Path to pretrained weights (optional)')
-    parser.add_argument('--batch-size', type=int, default=8,  # Reduced batch size
+    parser.add_argument('--batch-size', type=int, default=8,
                       help='Batch size')
-    parser.add_argument('--img-size', type=int, default=416,  # Smaller image size
+    parser.add_argument('--img-size', type=int, default=416,
                       help='Input image size')
     parser.add_argument('--epochs', type=int, default=100,
                       help='Number of epochs')
@@ -239,32 +239,114 @@ def main():
                       help='Output directory')
     parser.add_argument('--num-workers', type=int, default=2,
                       help='Number of dataloader workers')
+    parser.add_argument('--device', type=str, default='cuda',
+                      help='Device to use (cuda or cpu)')
     
     args = parser.parse_args()
     
-    # Create datasets with smaller image size
-    train_dataset = EnhancedObjectDetectionDataset(
-        Path(config['train']).parent.parent,
-        'train',
-        image_size=args.img_size
-    )
-    val_dataset = EnhancedObjectDetectionDataset(
-        Path(config['val']).parent.parent,
-        'valid',
-        image_size=args.img_size
-    )
+    # Load and print config
+    config = load_yaml(args.data)
     
-    # Create model
-    model = EnhancedDetectionModel(num_classes=config['nc'])
+    # Update config with command line arguments
+    config.update({
+        'batch_size': args.batch_size,
+        'epochs': args.epochs,
+        'img_size': args.img_size,
+        'device': args.device
+    })
     
-    # Load pretrained weights if provided
-    if args.weights:
-        print(f"Loading weights from {args.weights}")
-        checkpoint = torch.load(args.weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
+    # Print configuration
+    print("\nConfiguration:")
+    print(f"Dataset path: {config['train']}")
+    print(f"Number of classes: {config['nc']}")
+    print(f"Class names: {config['names']}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Image size: {config['img_size']}")
+    print(f"Epochs: {config['epochs']}")
+    print(f"Device: {config['device']}\n")
     
-    # Train
-    train_model(model, train_loader, val_loader, config, args.output_dir)
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save configuration
+    with open(output_dir / 'config.yaml', 'w') as f:
+        yaml.dump(config, f)
+    
+    try:
+        # Create datasets
+        train_dataset = EnhancedObjectDetectionDataset(
+            Path(config['train']).parent.parent,
+            'train',
+            image_size=args.img_size
+        )
+        print(f"Created training dataset with {len(train_dataset)} samples")
+        
+        val_dataset = EnhancedObjectDetectionDataset(
+            Path(config['val']).parent.parent,
+            'valid',
+            image_size=args.img_size
+        )
+        print(f"Created validation dataset with {len(val_dataset)} samples")
+        
+        # Create dataloaders
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+        
+        # Create model
+        print("Creating model...")
+        model = EnhancedDetectionModel(num_classes=config['nc'])
+        model = model.to(device)
+        
+        # Load pretrained weights if provided
+        if args.weights:
+            print(f"Loading weights from {args.weights}")
+            checkpoint = torch.load(args.weights, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            print("Weights loaded successfully")
+        
+        # Train
+        print("\nStarting training...")
+        train_model(model, train_loader, val_loader, config, args.output_dir)
+        
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        raise
+    
+    finally:
+        # Cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

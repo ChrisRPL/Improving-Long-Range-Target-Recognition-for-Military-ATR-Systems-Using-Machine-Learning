@@ -29,9 +29,17 @@ def load_yaml(yaml_path):
 def train_model(model, train_loader, val_loader, config, output_dir):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    model = model.to(device)
     
+    # Enable gradient checkpointing
+    model = model.to(device)
+    if hasattr(model, 'encoder'):
+        model.encoder.gradient_checkpointing = True
+    if hasattr(model, 'decoder'):
+        model.decoder.gradient_checkpointing = True
+    
+    # Setup training
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
+    scaler = torch.cuda.amp.GradScaler()  # for mixed precision training
     
     # Initialize metric trackers
     best_map50 = 0
@@ -43,6 +51,10 @@ def train_model(model, train_loader, val_loader, config, output_dir):
         'precision': [],
         'recall': []
     }
+    
+    # Create output directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     for epoch in range(config['epochs']):
         # Training phase
@@ -58,21 +70,24 @@ def train_model(model, train_loader, val_loader, config, output_dir):
             # Get non-empty label masks
             valid_labels = (labels.sum(dim=2) > 0)
             
-            # Forward pass
-            pred_boxes, pred_logits = model(images, flows)
+            # Mixed precision training
+            with torch.cuda.amp.autocast():
+                # Forward pass
+                pred_boxes, pred_logits = model(images, flows)
+                
+                # Calculate loss
+                loss = model.loss_fn(
+                    pred_boxes,
+                    pred_logits,
+                    labels[valid_labels][:, 1:],
+                    labels[valid_labels][:, 0].long()
+                )
             
-            # Calculate loss
-            loss = model.loss_fn(
-                pred_boxes, 
-                pred_logits, 
-                labels[valid_labels][:, 1:],
-                labels[valid_labels][:, 0].long()
-            )
-            
-            # Backward pass
+            # Backward pass with gradient scaling
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             # Update metrics
             train_loss += loss.item()
@@ -100,6 +115,10 @@ def train_model(model, train_loader, val_loader, config, output_dir):
             progress_bar.set_postfix({
                 'loss': f'{loss.item():.4f}'
             })
+            
+            # Clear cache periodically
+            if batch_idx % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Calculate epoch metrics
         train_loss = train_loss / len(train_loader)
@@ -117,16 +136,17 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                 labels = batch['labels'].to(device)
                 valid_labels = (labels.sum(dim=2) > 0)
                 
-                # Forward pass
-                pred_boxes, pred_logits = model(images, flows)
-                
-                # Calculate loss
-                loss = model.loss_fn(
-                    pred_boxes,
-                    pred_logits,
-                    labels[valid_labels][:, 1:],
-                    labels[valid_labels][:, 0].long()
-                )
+                with torch.cuda.amp.autocast():
+                    # Forward pass
+                    pred_boxes, pred_logits = model(images, flows)
+                    
+                    # Calculate loss
+                    loss = model.loss_fn(
+                        pred_boxes,
+                        pred_logits,
+                        labels[valid_labels][:, 1:],
+                        labels[valid_labels][:, 0].long()
+                    )
                 
                 val_loss += loss.item()
                 
@@ -173,19 +193,35 @@ def train_model(model, train_loader, val_loader, config, output_dir):
         # Save best model
         if val_metrics['map_50'] > best_map50:
             best_map50 = val_metrics['map_50']
-            checkpoint_path = Path(output_dir) / 'best_model.pt'
+            checkpoint_path = output_dir / 'best_model.pt'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
                 'metrics': val_metrics,
                 'config': config,
             }, str(checkpoint_path))
             print(f"Saved best model with mAP50: {best_map50:.4f}")
         
+        # Save latest model
+        checkpoint_path = output_dir / 'last_model.pt'
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'metrics': val_metrics,
+            'config': config,
+        }, str(checkpoint_path))
+        
         # Save metrics history
-        metrics_path = Path(output_dir) / 'metrics_history.pth'
+        metrics_path = output_dir / 'metrics_history.pth'
         torch.save(metrics_history, str(metrics_path))
+        
+        # Clear cache between epochs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def main():
     parser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
@@ -193,8 +229,10 @@ def main():
                       help='Path to data.yaml file')
     parser.add_argument('--weights', type=str, default=None,
                       help='Path to pretrained weights (optional)')
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=8,  # Reduced batch size
                       help='Batch size')
+    parser.add_argument('--img-size', type=int, default=416,  # Smaller image size
+                      help='Input image size')
     parser.add_argument('--epochs', type=int, default=100,
                       help='Number of epochs')
     parser.add_argument('--output-dir', type=str, default='runs/train',
@@ -204,49 +242,16 @@ def main():
     
     args = parser.parse_args()
     
-    # Load config
-    config = load_yaml(args.data)
-    
-    # Update config with command line arguments
-    config.update({
-        'batch_size': args.batch_size,
-        'epochs': args.epochs,
-    })
-    
-    # Print configuration
-    print("\nConfiguration:")
-    print(f"Dataset path: {config['train']}")
-    print(f"Number of classes: {config['nc']}")
-    print(f"Class names: {config['names']}")
-    print(f"Batch size: {config['batch_size']}")
-    print(f"Epochs: {config['epochs']}\n")
-    
-    # Create datasets
+    # Create datasets with smaller image size
     train_dataset = EnhancedObjectDetectionDataset(
-        Path(config['train']).parent.parent,  # Get root path
-        'train'
+        Path(config['train']).parent.parent,
+        'train',
+        image_size=args.img_size
     )
     val_dataset = EnhancedObjectDetectionDataset(
-        Path(config['val']).parent.parent,  # Get root path
-        'valid'
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
+        Path(config['val']).parent.parent,
+        'valid',
+        image_size=args.img_size
     )
     
     # Create model

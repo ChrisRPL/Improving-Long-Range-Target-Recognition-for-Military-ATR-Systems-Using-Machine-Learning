@@ -9,16 +9,19 @@ class Backbone(nn.Module):
         super().__init__()
         resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         
-        # Modify first conv layer to accept different number of input channels
+        # Enable gradient checkpointing
+        resnet.layer1.use_checkpoint = True
+        resnet.layer2.use_checkpoint = True
+        resnet.layer3.use_checkpoint = True
+        resnet.layer4.use_checkpoint = True
+        
         if input_channels != 3:
             self.first_conv = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            # Initialize with average of pretrained weights
             pretrained_weight = resnet.conv1.weight.data
             self.first_conv.weight.data = torch.mean(pretrained_weight, dim=1, keepdim=True).repeat(1, input_channels, 1, 1)
         else:
             self.first_conv = resnet.conv1
         
-        # Rest of ResNet layers
         self.features = nn.Sequential(
             self.first_conv,
             resnet.bn1,

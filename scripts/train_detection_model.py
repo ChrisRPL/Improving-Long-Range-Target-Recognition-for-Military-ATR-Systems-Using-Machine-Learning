@@ -6,7 +6,7 @@ from tqdm import tqdm
 import argparse
 import sys
 from models.detection_model import EnhancedDetectionModel
-from models.detection_dataset import EnhancedObjectDetectionDataset
+from models.detection_dataset import EnhancedObjectDetectionDataset, collate_fn
 
 sys.path.append(str(Path(__file__).parent.parent))
 

@@ -49,21 +49,23 @@ def process_sequence(sequence_paths):
     
     return flows
 
-def prepare_optical_flow(data_root: Path):
+def prepare_optical_flow(dataset_root: Path):
     """Prepare optical flow for all dataset splits."""
-    data_root = Path(data_root)
+    dataset_root = Path(dataset_root)
+    print(f"Processing dataset at: {dataset_root}")
     
     for split in ['train', 'valid', 'test']:
         print(f"\nProcessing {split} split...")
         
         # Setup paths
-        images_dir = data_root / split / 'images'
-        flow_dir = data_root / split / 'flow'
-        flow_dir.mkdir(exist_ok=True, parents=True)
+        images_dir = dataset_root / split / 'images'
+        flow_dir = dataset_root / split / 'flow'
         
         if not images_dir.exists():
             print(f"Images directory not found: {images_dir}")
             continue
+            
+        flow_dir.mkdir(exist_ok=True, parents=True)
         
         # Get sorted image paths
         image_paths = sorted(list(images_dir.glob('*.jpg')))
@@ -76,45 +78,22 @@ def prepare_optical_flow(data_root: Path):
             
         print(f"Found {len(image_paths)} images")
         
-        # Group images by sequence
-        sequences = {}
-        for img_path in image_paths:
-            # Adjust this based on your image naming convention
-            # Example: if images are named like "video_001_frame_001.jpg"
-            seq_id = '_'.join(img_path.stem.split('_')[:2])
-            if seq_id not in sequences:
-                sequences[seq_id] = []
-            sequences[seq_id].append(img_path)
+        # Process all images sequentially
+        flows = process_sequence(image_paths)
         
-        print(f"Found {len(sequences)} sequences")
+        # Save flows
+        print(f"Saving {len(flows)} flow files...")
+        for img_path, flow in tqdm(flows, desc=f"Saving {split} flows"):
+            flow_path = flow_dir / f"{img_path.stem}_flow.npy"
+            np.save(str(flow_path), flow)
         
-        # Process each sequence
-        total_flows = 0
-        for seq_id, seq_paths in tqdm(sequences.items(), desc=f"Processing {split} sequences"):
-            flows = process_sequence(sorted(seq_paths))
-            
-            # Save flows
-            for img_path, flow in flows:
-                flow_path = flow_dir / f"{img_path.stem}_flow.npy"
-                np.save(str(flow_path), flow)
-                total_flows += 1
-        
-        print(f"Generated {total_flows} flow files for {split} split")
+        print(f"Generated {len(flows)} flow files for {split} split")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, required=True, help='Path to data.yaml file')
+    parser.add_argument('--dataset_root', type=str, required=True, 
+                      help='Root directory of dataset containing train/valid/test folders')
     args = parser.parse_args()
     
-    # Load data.yaml
-    import yaml
-    with open(args.data, 'r') as f:
-        data_config = yaml.safe_load(f)
-    
-    # Get dataset root from training path
-    train_path = Path(data_config['train'])
-    dataset_root = train_path.parent.parent
-    
-    print(f"Dataset root: {dataset_root}")
-    prepare_optical_flow(dataset_root)
+    prepare_optical_flow(args.dataset_root)

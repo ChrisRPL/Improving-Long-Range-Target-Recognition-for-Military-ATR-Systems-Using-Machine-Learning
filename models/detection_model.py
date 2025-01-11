@@ -3,20 +3,11 @@ import torch.nn as nn
 import torchvision.models as models
 from torchmetrics.detection import MeanAveragePrecision
 import math
-from torch.utils.data import Dataset, DataLoader
-import torch.amp as amp  # Updated import
-from scipy.optimize import linear_sum_assignment  # Add this import
 
 class Backbone(nn.Module):
     def __init__(self, input_channels=3):
         super().__init__()
         resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        
-        # Enable gradient checkpointing
-        resnet.layer1.use_checkpoint = True
-        resnet.layer2.use_checkpoint = True
-        resnet.layer3.use_checkpoint = True
-        resnet.layer4.use_checkpoint = True
         
         if input_channels != 3:
             self.first_conv = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -37,192 +28,124 @@ class Backbone(nn.Module):
         )
         
     def forward(self, x):
-        return self.features(x)
+        return self.features(x)  # Output: [B, 2048, H/32, W/32]
 
 class TransformerModel(nn.Module):
-    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100):
+    def __init__(self, d_model=256, nhead=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100):
         super().__init__()
         self.d_model = d_model
+        self.num_queries = num_queries
         
-        # Feature projection (adjust input channels for concatenated features)
-        self.input_proj = nn.Conv2d(4096, d_model, kernel_size=1)  # 2048*2 because we concatenate two backbone outputs
+        # Input projection for backbone features
+        self.input_proj = nn.Conv2d(4096, d_model, kernel_size=1)
         
         # Positional embeddings
-        self.pos_embed = nn.Parameter(torch.zeros(1, d_model, 32, 32))
+        self.pos_embed = nn.Parameter(torch.zeros(1, d_model, 13, 13))  # For 416x416 input
         self.query_embed = nn.Parameter(torch.zeros(num_queries, d_model))
         
-        # Transformer with batch_first=True
+        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model, 
-            nhead, 
+            d_model=d_model, 
+            nhead=nhead,
             dim_feedforward=2048,
             batch_first=True
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
         
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model, 
-            nhead, 
+            d_model=d_model,
+            nhead=nhead,
             dim_feedforward=2048,
             batch_first=True
         )
+        
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
         
-        # Initialize positional embeddings
-        torch.nn.init.normal_(self.pos_embed, mean=0, std=0.02)
-        torch.nn.init.normal_(self.query_embed, mean=0, std=0.02)
-        
     def forward(self, features):
-        # Project features
+        # Project concatenated features
         features = self.input_proj(features)  # [B, d_model, H, W]
+        B, C, H, W = features.shape
         
-        # Add positional embeddings
-        pos = self.pos_embed.repeat(features.shape[0], 1, 1, 1)
+        # Add positional encoding
+        pos = self.pos_embed
+        if H != pos.shape[2] or W != pos.shape[3]:
+            pos = nn.functional.interpolate(pos, size=(H, W), mode='bicubic')
         features = features + pos
         
-        # Reshape for transformer (batch_first=True)
-        features = features.flatten(2).transpose(1, 2)  # [B, HW, d_model]
+        # Reshape for transformer
+        features = features.flatten(2).transpose(1, 2)  # [B, H*W, d_model]
         
-        # Transformer processing
+        # Generate queries
+        queries = self.query_embed.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, d_model]
+        
+        # Transformer encoding and decoding
         memory = self.encoder(features)
-        
-        # Prepare queries
-        batch_size = features.shape[0]
-        tgt = self.query_embed.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, num_queries, d_model]
-        
-        # Decode
-        output = self.decoder(tgt, memory)
+        output = self.decoder(queries, memory)  # [B, num_queries, d_model]
         
         return output
 
 class EnhancedDetectionModel(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        # Separate backbones for image and flow
+        self.num_classes = num_classes
+        self.d_model = 256
+        self.num_queries = 100
+        
+        # Backbones
         self.img_backbone = Backbone(input_channels=3)
         self.flow_backbone = Backbone(input_channels=2)
         
         # Transformer
-        self.transformer = TransformerModel()
+        self.transformer = TransformerModel(
+            d_model=self.d_model,
+            num_queries=self.num_queries
+        )
         
         # Prediction heads
-        self.bbox_head = nn.Linear(512, 4)  # (cx, cy, w, h)
-        self.class_head = nn.Linear(512, num_classes)
+        self.bbox_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, 4)
+        )
+        
+        self.class_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, num_classes + 1)  # +1 for background class
+        )
+        
+        # Initialize prediction heads
+        for layer in self.bbox_head.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+                
+        for layer in self.class_head.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
         
         # Metrics
         self.map_metric = MeanAveragePrecision(
-            box_format='cxcywh',  # YOLOv8 format
+            box_format='cxcywh',
             iou_thresholds=[0.5],
             rec_thresholds=None,
             max_detection_thresholds=[1, 10, 100]
         )
     
     def forward(self, images, flows):
-        """
-        Forward pass of the model.
-        Args:
-            images: Tensor of shape [B, 3, H, W]
-            flows: Tensor of shape [B, 2, H, W]
-        Returns:
-            boxes: Tensor of shape [B, num_queries, 4] in (cx, cy, w, h) format
-            logits: Tensor of shape [B, num_queries, num_classes]
-        """
-        # Extract features using separate backbones
-        img_features = self.img_backbone(images)  # [B, 2048, H/32, W/32]
-        flow_features = self.flow_backbone(flows)  # [B, 2048, H/32, W/32]
+        # Extract features [B, 2048, H/32, W/32]
+        img_features = self.img_backbone(images)
+        flow_features = self.flow_backbone(flows)
         
-        # Concatenate features along channel dimension
+        # Concatenate features
         features = torch.cat([img_features, flow_features], dim=1)  # [B, 4096, H/32, W/32]
         
         # Transform features
         transformer_output = self.transformer(features)  # [B, num_queries, d_model]
         
-        # Predictions
-        boxes = self.bbox_head(transformer_output).sigmoid()  # Normalize to [0,1]
-        logits = self.class_head(transformer_output)
+        # Predict boxes and classes
+        boxes = self.bbox_head(transformer_output).sigmoid()  # [B, num_queries, 4]
+        logits = self.class_head(transformer_output)  # [B, num_queries, num_classes+1]
         
         return boxes, logits
-    
-    def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
-        """
-        Calculate loss for training.
-        Args:
-            pred_boxes: Predicted boxes [B, num_queries, 4]
-            pred_logits: Predicted class logits [B, num_queries, num_classes]
-            target_boxes: Ground truth boxes [B, max_objects, 4]
-            target_labels: Ground truth labels [B, max_objects]
-        Returns:
-            total_loss: Combined loss for training
-        """
-        # Flatten predictions for loss calculation
-        pred_boxes = pred_boxes.view(-1, 4)
-        pred_logits = pred_logits.view(-1, pred_logits.size(-1))
-        
-        # Flatten targets and remove padding
-        valid_mask = target_labels.ne(-1)  # Identify valid targets
-        target_boxes = target_boxes[valid_mask]
-        target_labels = target_labels[valid_mask]
-        
-        if len(target_boxes) == 0:
-            # Handle case with no valid targets
-            dummy_box_target = torch.zeros_like(pred_boxes[0:1])
-            giou_loss = 1 - box_iou(pred_boxes[0:1], dummy_box_target)[0, 0]
-            cls_loss = pred_logits.sum() * 0  # zero loss for classification
-        else:
-            # Calculate matching cost between predictions and targets
-            cost_giou = -box_iou(pred_boxes, target_boxes)
-            cost_cls = -pred_logits[:, target_labels.long()]
-            
-            # Hungarian matching
-            cost_matrix = cost_giou + cost_cls
-            indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
-            indices = [torch.as_tensor(i, dtype=torch.int64) for i in indices]
-            
-            # Calculate losses using matched pairs
-            giou_loss = 1 - box_iou(
-                pred_boxes[indices[0]], 
-                target_boxes[indices[1]]
-            ).diag().mean()
-            
-            cls_loss = F.cross_entropy(
-                pred_logits[indices[0]], 
-                target_labels[indices[1]].long()
-            )
-        
-        # Combine losses with weighting
-        total_loss = giou_loss + cls_loss
-        return total_loss
-    
-    def update_metrics(self, pred_boxes, pred_logits, targets):
-        """
-        Update evaluation metrics.
-        Args:
-            pred_boxes: Predicted boxes [B, num_queries, 4]
-            pred_logits: Predicted class logits [B, num_queries, num_classes]
-            targets: List of target dictionaries containing 'boxes' and 'labels'
-        """
-        predictions = [{
-            'boxes': boxes,
-            'scores': scores,
-            'labels': labels,
-        } for boxes, scores, labels in zip(
-            pred_boxes,
-            torch.softmax(pred_logits, dim=-1).max(dim=-1).values,
-            torch.argmax(pred_logits, dim=-1)
-        )]
-        
-        self.map_metric.update(predictions, targets)
-    
-    def get_metrics(self):
-        """
-        Compute and return all metrics.
-        Returns:
-            metrics: Dictionary containing all computed metrics
-        """
-        metrics = self.map_metric.compute()
-        return {
-            'mAP50': metrics['map_50'].item(),
-            'mAP50-95': metrics['map'].item(),
-            'precision': metrics['map_per_class'].mean().item(),
-            'recall': metrics['mar_100'].item()
-        }

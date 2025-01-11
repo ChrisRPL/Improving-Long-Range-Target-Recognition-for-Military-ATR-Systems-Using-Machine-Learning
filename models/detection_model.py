@@ -75,7 +75,7 @@ class EnhancedDetectionModel(nn.Module):
         self.map_metric = MeanAveragePrecision(
             box_format='cxcywh',  # YOLOv8 format
             iou_thresholds=[0.5],
-            rec_thresholds=torch.linspace(0.0, 1.00, 100),
+            rec_thresholds=None,
             max_detection_thresholds=[100]
         )
         

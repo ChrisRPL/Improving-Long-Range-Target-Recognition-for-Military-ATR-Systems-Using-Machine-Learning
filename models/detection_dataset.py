@@ -40,13 +40,11 @@ class EnhancedObjectDetectionDataset(Dataset):
         return len(self.image_paths)
 
     def load_labels(self, img_path):
-        """
-        Load labels from txt file.
-        Format: class_id x1 y1 x2 y1 x1 y2 x2 y2
-        """
+        """Load labels from txt file."""
         label_path = self.labels_dir / f"{img_path.stem}.txt"
         try:
             if not label_path.exists():
+                print(f"No label file found for {img_path}")
                 return torch.zeros((1, 5))
 
             labels = []
@@ -54,15 +52,17 @@ class EnhancedObjectDetectionDataset(Dataset):
                 for line in f:
                     values = line.strip().split()
                     if len(values) == 9:  # class_id + 8 coordinates
-                        # Parse values
-                        class_id = int(values[0])
-                        coords = [float(v) for v in values[1:]]
+                        class_id = int(float(values[0]))  # Class ID should be an integer
+                        if not (0 <= class_id < self.num_classes):
+                            print(f"Invalid class ID {class_id} in {label_path}")
+                            continue
+                        
+                        # Convert coordinates to x, y, w, h format
+                        x_coords = [float(values[i]) for i in [1,3,5,7]]
+                        y_coords = [float(values[i]) for i in [2,4,6,8]]
                     
-                        # Convert from x1,y1,x2,y1,x1,y2,x2,y2 to YOLO format (x_center, y_center, width, height)
-                        x1 = min(coords[0], coords[2], coords[4], coords[6])
-                        x2 = max(coords[0], coords[2], coords[4], coords[6])
-                        y1 = min(coords[1], coords[3], coords[5], coords[7])
-                        y2 = max(coords[1], coords[3], coords[5], coords[7])
+                        x1, x2 = min(x_coords), max(x_coords)
+                        y1, y2 = min(y_coords), max(y_coords)
                     
                         # Calculate center coordinates and dimensions
                         x_center = (x1 + x2) / 2
@@ -70,13 +70,15 @@ class EnhancedObjectDetectionDataset(Dataset):
                         width = x2 - x1
                         height = y2 - y1
                     
-                        # Append in YOLO format: [class_id, x_center, y_center, width, height]
                         labels.append([class_id, x_center, y_center, width, height])
 
             if not labels:
+                print(f"No valid labels found in {label_path}")
                 return torch.zeros((1, 5))
 
-            return torch.tensor(labels, dtype=torch.float32)
+            label_tensor = torch.tensor(labels, dtype=torch.float32)
+            print(f"Loaded {len(labels)} labels from {label_path}")
+            return label_tensor
 
         except Exception as e:
             print(f"Error loading labels from {label_path}: {str(e)}")

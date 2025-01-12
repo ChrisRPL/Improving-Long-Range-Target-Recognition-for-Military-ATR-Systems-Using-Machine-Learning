@@ -5,18 +5,11 @@ import cv2
 import numpy as np
 from pathlib import Path
 from torchvision import transforms
-from typing import Dict, List, Tuple
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import logging
-from torch.utils.data import DataLoader
-import yaml
-import argparse
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from torchmetrics.detection import MeanAveragePrecision
-import torch.optim as optim
-from torch.cuda.amp import GradScaler
-import torch.nn.functional as F
-from datetime import datetime
+from typing import Dict, List, Tuple
+import random
 
 class EnhancedObjectDetectionDataset(Dataset):
     def __init__(self, 
@@ -26,140 +19,144 @@ class EnhancedObjectDetectionDataset(Dataset):
                  split_ratio: float = 0.8,
                  image_size: int = 416,
                  num_classes: int = 10,
+                 augment: bool = True,
                  seed: int = 42):
         """
-        Args:
-            image_dir: Path to directory containing all images
-            annotation_file: Path to COCO annotation JSON file
-            split: Dataset split ('train' or 'val')
-            split_ratio: Ratio of data to use for training
-            image_size: Target image size for resizing
-            num_classes: Number of object classes
-            seed: Random seed for reproducible splits
+        Enhanced dataset class with proper augmentations and error handling
         """
         self.image_dir = Path(image_dir)
         self.split = split
         self.image_size = image_size
         self.num_classes = num_classes
+        self.augment = augment and split == 'train'
         
         # Setup logging
         self.logger = logging.getLogger(f"{split}_dataset")
         self.logger.setLevel(logging.INFO)
         
-        self.logger.info(f"Initializing {split} dataset...")
-        self.logger.info(f"Image directory: {self.image_dir}")
-        self.logger.info(f"Annotation file: {annotation_file}")
-        
-        # Load COCO annotations
+        # Load annotations
         try:
             with open(annotation_file, 'r') as f:
                 self.coco = json.load(f)
-            self.logger.info("Successfully loaded COCO annotations")
+            self.logger.info(f"Loaded {len(self.coco['images'])} images from annotations")
         except Exception as e:
             self.logger.error(f"Error loading annotations: {str(e)}")
             raise
-            
-        # Get all image ids and create split
-        all_image_ids = [img['id'] for img in self.coco['images']]
         
-        # Create reproducible random split
-        np.random.seed(seed)
-        np.random.shuffle(all_image_ids)
+        # Create reproducible split
+        random.seed(seed)
+        all_image_ids = [img['id'] for img in self.coco['images']]
+        random.shuffle(all_image_ids)
         split_idx = int(len(all_image_ids) * split_ratio)
         
-        # Select image ids for this split
-        if split == 'train':
-            self.image_ids = all_image_ids[:split_idx]
-        else:  # 'val'
-            self.image_ids = all_image_ids[split_idx:]
-            
-        self.logger.info(f"Using {len(self.image_ids)} images for {split}")
+        self.image_ids = all_image_ids[:split_idx] if split == 'train' else all_image_ids[split_idx:]
         
         # Create image id to annotations mapping
         self.annotations = {}
+        self.cat_id_to_name = {cat['id']: cat['name'] for cat in self.coco['categories']}
         
-        # Create category id to name mapping
-        self.cat_id_to_name = {
-            cat['id']: cat['name'] 
-            for cat in self.coco['categories']
-        }
-        
-        # Only keep images for this split
+        # Process annotations
         for img in self.coco['images']:
             if img['id'] in self.image_ids:
                 self.annotations[img['id']] = {
-                    'file_name': img['file_name'].replace("data/", ""),
+                    'file_name': img['file_name'],
                     'width': img['width'],
                     'height': img['height'],
                     'objects': []
                 }
-            
-        # Only keep annotations for images in this split
-        ann_count = 0
+        
+        # Process object annotations
         for ann in self.coco['annotations']:
             img_id = ann['image_id']
             if img_id in self.annotations:
-                # Verify bbox format
                 bbox = ann['bbox']
                 if len(bbox) != 4:
                     self.logger.warning(f"Skipping invalid bbox: {bbox}")
                     continue
-                    
+                
                 self.annotations[img_id]['objects'].append({
-                    'bbox': bbox,  # [x, y, width, height]
+                    'bbox': bbox,
                     'category_id': ann['category_id']
                 })
-                ann_count += 1
-                
-        self.logger.info(f"Loaded {len(self.annotations)} images and {ann_count} annotations for {split}")
         
-        # Setup transforms
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                              std=[0.229, 0.224, 0.225])
-        ])
+        # Setup augmentations
+        self.transform = self._get_transforms()
         
-        # Create flow directory path
-        self.flow_dir = self.image_dir.parent / 'flow'
-        if not self.flow_dir.exists():
-            self.logger.warning(f"Flow directory not found: {self.flow_dir}")
-            
-        # Verify image files exist
-        self._verify_images()
+        # Verify all files exist
+        self._verify_files()
         
-    def _verify_images(self):
-        """Verify all image files exist"""
+    def _verify_files(self):
+        """Verify all required files exist"""
         missing_images = []
+        missing_flows = []
+        
         for img_id in self.image_ids:
-            img_path = self.image_dir / self.annotations[img_id]['file_name'].replace("data/", "")
+            img_path = self.image_dir / self.annotations[img_id]['file_name']
+            flow_path = self.image_dir.parent / 'flow' / f"{img_path.stem}_flow.npy"
+            
             if not img_path.exists():
                 missing_images.append(str(img_path))
+            if not flow_path.exists():
+                missing_flows.append(str(flow_path))
         
         if missing_images:
             self.logger.warning(f"Missing {len(missing_images)} images")
-            self.logger.debug(f"First few missing images: {missing_images[:5]}")
+        if missing_flows:
+            self.logger.warning(f"Missing {len(missing_flows)} flow files")
+    
+    def _get_transforms(self):
+        """Get augmentation pipeline"""
+        if self.augment:
+            return A.Compose([
+                A.RandomScale(scale_limit=0.2),
+                A.RandomRotate90(p=0.3),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.1),
+                A.OneOf([
+                    A.RandomBrightnessContrast(),
+                    A.RandomGamma(),
+                    A.HueSaturationValue()
+                ], p=0.3),
+                A.OneOf([
+                    A.GaussNoise(),
+                    A.GaussianBlur(),
+                    A.MotionBlur()
+                ], p=0.2),
+                A.Resize(self.image_size, self.image_size),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                ),
+                ToTensorV2()
+            ], bbox_params=A.BboxParams(
+                format='coco',
+                label_fields=['category_ids']
+            ))
+        else:
+            return A.Compose([
+                A.Resize(self.image_size, self.image_size),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                ),
+                ToTensorV2()
+            ], bbox_params=A.BboxParams(
+                format='coco',
+                label_fields=['category_ids']
+            ))
     
     def __len__(self):
         return len(self.image_ids)
     
-    def convert_bbox(self, bbox: List[float], orig_w: int, orig_h: int) -> torch.Tensor:
-        """
-        Convert COCO bbox [x, y, w, h] to normalized [x_center, y_center, w, h]
-        """
-        x, y, w, h = bbox
-        
-        # Convert to center coordinates
-        x_center = x + w/2
-        y_center = y + h/2
-        
-        # Normalize coordinates
-        x_center /= orig_w
-        y_center /= orig_h
-        w /= orig_w
-        h /= orig_h
-        
-        return torch.tensor([x_center, y_center, w, h], dtype=torch.float32)
+    def _load_flow(self, img_path: Path) -> np.ndarray:
+        """Load and process optical flow"""
+        flow_path = self.image_dir.parent / 'flow' / f"{img_path.stem}_flow.npy"
+        try:
+            flow = np.load(str(flow_path))
+            return flow.astype(np.float32)
+        except Exception as e:
+            self.logger.warning(f"Error loading flow {flow_path}: {str(e)}")
+            return np.zeros((self.image_size, self.image_size, 2), dtype=np.float32)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         img_id = self.image_ids[idx]
@@ -168,80 +165,183 @@ class EnhancedObjectDetectionDataset(Dataset):
         # Load image
         img_path = self.image_dir / img_info['file_name']
         try:
-            img = cv2.imread(str(img_path))
-            if img is None:
+            image = cv2.imread(str(img_path))
+            if image is None:
                 raise ValueError(f"Could not load image: {img_path}")
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         except Exception as e:
             self.logger.error(f"Error loading image {img_path}: {str(e)}")
             raise
         
-        # Original image dimensions
-        orig_h, orig_w = img.shape[:2]
+        # Load flow
+        flow = self._load_flow(img_path)
         
-        # Load optical flow
-        flow_path = self.flow_dir / f"{img_path.stem}_flow.npy"
-        if flow_path.exists():
-            try:
-                flow = np.load(str(flow_path))
-            except Exception as e:
-                self.logger.warning(f"Error loading flow {flow_path}: {str(e)}")
-                flow = np.zeros((orig_h, orig_w, 2), dtype=np.float32)
-        else:
-            flow = np.zeros((orig_h, orig_w, 2), dtype=np.float32)
-        
-        # Resize image and flow
-        img = cv2.resize(img, (self.image_size, self.image_size))
-        flow = cv2.resize(flow, (self.image_size, self.image_size))
-        
-        # Prepare labels
+        # Prepare boxes and labels
+        boxes = []
         labels = []
         for obj in img_info['objects']:
-            category_id = obj['category_id']
-            bbox = self.convert_bbox(obj['bbox'], orig_w, orig_h)
-            labels.append(torch.cat([torch.tensor([category_id]), bbox]))
+            boxes.append(obj['bbox'])
+            labels.append(obj['category_id'])
         
-        if not labels:
-            labels = torch.zeros((1, 5))  # One dummy box with class 0
+        if not boxes:
+            boxes = np.zeros((0, 4), dtype=np.float32)
+            labels = np.zeros(0, dtype=np.int64)
         else:
-            labels = torch.stack(labels)
+            boxes = np.array(boxes, dtype=np.float32)
+            labels = np.array(labels, dtype=np.int64)
         
-        # Convert image to tensor and normalize
-        img = self.transform(img)
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
+        # Apply transforms
+        transformed = self.transform(
+            image=image,
+            bboxes=boxes,
+            category_ids=labels
+        )
+        
+        image = transformed['image']
+        boxes = np.array(transformed['bboxes']) if transformed['bboxes'] else np.zeros((0, 4))
+        labels = np.array(transformed['category_ids']) if transformed['category_ids'] else np.zeros(0)
+        
+        # Convert flow
+        flow = torch.from_numpy(flow.transpose(2, 0, 1))
+        
+        # Convert boxes to cxcywh format
+        if len(boxes) > 0:
+            boxes = self._convert_to_cxcywh(boxes)
+        else:
+            boxes = torch.zeros((0, 4))
         
         return {
-            'image': img,
+            'image': image,
             'flow': flow,
-            'labels': labels,
+            'boxes': torch.as_tensor(boxes, dtype=torch.float32),
+            'labels': torch.as_tensor(labels, dtype=torch.int64),
+            'img_id': img_id,
             'img_path': str(img_path)
         }
+    
+    @staticmethod
+    def _convert_to_cxcywh(boxes):
+        """Convert COCO format (x,y,w,h) to cxcywh format"""
+        boxes = torch.as_tensor(boxes)
+        x, y, w, h = boxes.unbind(-1)
+        cx = x + w/2
+        cy = y + h/2
+        return torch.stack([cx, cy, w, h], dim=-1)
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate function for DataLoader
-    """
+def collate_fn(batch):
+    """Custom collate function for dataloader"""
     images = torch.stack([item['image'] for item in batch])
     flows = torch.stack([item['flow'] for item in batch])
     
-    # Find max number of labels in batch
-    max_labels = max(item['labels'].shape[0] for item in batch)
+    # Pad boxes and labels to same length
+    max_boxes = max(len(item['boxes']) for item in batch)
     
-    # Pad labels to same length
-    padded_labels = []
-    for item in batch:
-        if item['labels'].shape[0] < max_labels:
-            padding = torch.zeros((max_labels - item['labels'].shape[0], 5))
-            labels = torch.cat([item['labels'], padding], dim=0)
-        else:
-            labels = item['labels']
-        padded_labels.append(labels)
-    
-    labels = torch.stack(padded_labels)
+    if max_boxes == 0:
+        boxes = torch.zeros(len(batch), 0, 4)
+        labels = torch.zeros(len(batch), 0, dtype=torch.int64)
+    else:
+        boxes = torch.zeros(len(batch), max_boxes, 4)
+        labels = torch.zeros(len(batch), max_boxes, dtype=torch.int64)
+        
+        for idx, item in enumerate(batch):
+            if len(item['boxes']) > 0:
+                boxes[idx, :len(item['boxes'])] = item['boxes']
+                labels[idx, :len(item['labels'])] = item['labels']
     
     return {
         'image': images,
-        'flow': flows,
+        'flow': flows
+        'boxes': boxes,
         'labels': labels,
-        'img_path': [item['img_path'] for item in batch]
+        'img_ids': [item['img_id'] for item in batch],
+        'img_paths': [item['img_path'] for item in batch]
     }
+
+class DataModule:
+    """Data module to handle all data-related operations"""
+    def __init__(
+        self,
+        dataset_dir: str,
+        batch_size: int = 8,
+        num_workers: int = 4,
+        image_size: int = 416,
+        split_ratio: float = 0.8,
+        augment: bool = True,
+        seed: int = 42
+    ):
+        self.dataset_dir = Path(dataset_dir)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.image_size = image_size
+        self.split_ratio = split_ratio
+        self.augment = augment
+        self.seed = seed
+        
+        # Validate paths
+        self.image_dir = self.dataset_dir / 'data'
+        self.annotation_file = self.dataset_dir / 'coco.json'
+        self.flow_dir = self.dataset_dir / 'flow'
+        
+        if not self.image_dir.exists():
+            raise ValueError(f"Images directory not found: {self.image_dir}")
+        if not self.annotation_file.exists():
+            raise ValueError(f"Annotation file not found: {self.annotation_file}")
+        if not self.flow_dir.exists():
+            raise ValueError(f"Flow directory not found: {self.flow_dir}")
+        
+        # Load category information
+        with open(self.annotation_file) as f:
+            coco_data = json.load(f)
+            self.categories = coco_data['categories']
+            self.num_classes = len(self.categories)
+    
+    def setup(self):
+        """Setup train and validation datasets"""
+        self.train_dataset = EnhancedObjectDetectionDataset(
+            image_dir=self.image_dir,
+            annotation_file=self.annotation_file,
+            split='train',
+            split_ratio=self.split_ratio,
+            image_size=self.image_size,
+            num_classes=self.num_classes,
+            augment=self.augment,
+            seed=self.seed
+        )
+        
+        self.val_dataset = EnhancedObjectDetectionDataset(
+            image_dir=self.image_dir,
+            annotation_file=self.annotation_file,
+            split='val',
+            split_ratio=self.split_ratio,
+            image_size=self.image_size,
+            num_classes=self.num_classes,
+            augment=False,
+            seed=self.seed
+        )
+    
+    def train_dataloader(self):
+        """Create training dataloader"""
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            drop_last=True
+        )
+    
+    def val_dataloader(self):
+        """Create validation dataloader"""
+        return torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+    
+    def get_category_names(self):
+        """Get mapping of category IDs to names"""
+        return {cat['id']: cat['name'] for cat in self.categories}

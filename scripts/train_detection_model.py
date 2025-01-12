@@ -1,26 +1,19 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
 from pathlib import Path
 import yaml
 from tqdm import tqdm
 import argparse
-import cv2
-import numpy as np
-from torchvision import transforms
-import os
-import warnings
-from typing import Dict, List
-from models.detection_dataset import EnhancedObjectDetectionDataset, collate_fn
-from models.detection_model import EnhancedDetectionModel
-warnings.filterwarnings('ignore')
-import sys
 import logging
 from datetime import datetime
 import matplotlib.pyplot as plt
-import torch.optim as optim
+from torch.cuda.amp import GradScaler
+from torch.optim.lr_scheduler import OneCycleLR
+import wandb
+import json
 
-
-sys.path.append(str(Path(__file__).parent.parent))
+from models.detection_model import EnhancedDetectionModel
+from models.detection_dataset import DataModule
 
 def setup_logger(output_dir):
     """Setup logger with file and console handlers"""
@@ -46,23 +39,97 @@ def setup_logger(output_dir):
     
     return logger
 
-def train_model(model, train_loader, val_loader, config, output_dir):
+def visualize_batch(images, boxes, labels, category_names, output_dir, epoch, batch_idx):
+    """Visualize a batch of predictions"""
+    import matplotlib.patches as patches
+    
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.ravel()
+    
+    for idx, (img, bbox, label) in enumerate(zip(images[:8], boxes[:8], labels[:8])):
+        img = img.cpu().permute(1, 2, 0).numpy()
+        img = (img * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]).clip(0, 1)
+        
+        axes[idx].imshow(img)
+        
+        for box, lbl in zip(bbox, label):
+            if lbl == 0:  # Skip background
+                continue
+            
+            x, y, w, h = box.cpu().numpy()
+            rect = patches.Rectangle(
+                (x - w/2, y - h/2), w, h,
+                linewidth=2, edgecolor='r', facecolor='none'
+            )
+            axes[idx].add_patch(rect)
+            axes[idx].text(
+                x - w/2, y - h/2 - 2,
+                category_names.get(lbl.item(), 'Unknown'),
+                color='white', bbox=dict(facecolor='red', alpha=0.5)
+            )
+        
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / f'batch_viz_epoch{epoch}_batch{batch_idx}.png')
+    plt.close()
+
+def train_model(args):
+    """Main training function"""
+    # Setup
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     logger = setup_logger(output_dir)
+    logger.info(f"Starting training with args: {args}")
+    
+    # Initialize wandb if requested
+    if args.use_wandb:
+        wandb.init(project="enhanced-detection", config=args)
+    
+    # Setup data
+    data_module = DataModule(
+        dataset_dir=args.dataset_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=args.image_size,
+        split_ratio=args.split_ratio,
+        augment=True
+    )
+    data_module.setup()
+    
+    category_names = data_module.get_category_names()
+    
+    # Create model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    model = EnhancedDetectionModel(num_classes=data_module.num_classes)
     model = model.to(device)
     
+    # Save category mapping
+    with open(output_dir / 'category_mapping.json', 'w') as f:
+        json.dump(category_names, f, indent=2)
+    
     # Setup training
-    optimizer = optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.get('lr', 1e-4),
-        epochs=config['epochs'],
-        steps_per_epoch=len(train_loader)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
     )
     
-    # Initialize metrics
+    scaler = GradScaler(enabled=True)
+    
+    # Calculate total steps for scheduler
+    total_steps = len(data_module.train_dataloader()) * args.epochs
+    
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=args.learning_rate,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy='cos'
+    )
+    
+    # Training loop
     best_map50 = 0
     metrics_history = {
         'train_loss': [], 'val_loss': [],
@@ -71,280 +138,190 @@ def train_model(model, train_loader, val_loader, config, output_dir):
         'per_class_map': []
     }
     
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for epoch in range(config['epochs']):
-        logger.info(f"\nStarting epoch {epoch+1}/{config['epochs']}")
+    for epoch in range(args.epochs):
+        logger.info(f"\nEpoch {epoch+1}/{args.epochs}")
         
         # Training phase
         model.train()
         train_loss = 0
         model.map_metric.reset()
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f'Epoch {epoch+1}')):
+        train_loader = data_module.train_dataloader()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(device)
             flows = batch['flow'].to(device)
+            boxes = batch['boxes'].to(device)
             labels = batch['labels'].to(device)
             
+            # Forward pass with automatic mixed precision
             with torch.cuda.amp.autocast():
                 pred_boxes, pred_logits = model(images, flows)
-                loss = model.loss_fn(pred_boxes, pred_logits, labels[..., 1:], labels[..., 0])
+                loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)
             
             # Backward pass
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             
             # Update metrics
             train_loss += loss.item()
+            model.update_metrics(pred_boxes.detach(), pred_logits.detach(), boxes, labels)
             
-            # Format predictions and targets for metrics
-            predictions = []
-            targets = []
+            # Update progress bar
+            pbar.set_postfix({'loss': loss.item()})
             
-            for i in range(len(labels)):
-                valid_mask = labels[i, :, 0] >= 0
-                targets.append({
-                    'boxes': labels[i, valid_mask, 1:].cpu(),
-                    'labels': labels[i, valid_mask, 0].long().cpu()
-                })
-                
-                scores = torch.softmax(pred_logits[i], dim=-1)
-                max_scores, pred_labels = scores.max(dim=-1)
-                
-                # Filter predictions by confidence
-                conf_mask = max_scores > 0.05
-                predictions.append({
-                    'boxes': pred_boxes[i][conf_mask].cpu(),
-                    'scores': max_scores[conf_mask].cpu(),
-                    'labels': pred_labels[conf_mask].cpu()
-                })
-            
-            model.map_metric.update(predictions, targets)
+            # Visualize batch occasionally
+            if batch_idx % args.viz_interval == 0:
+                visualize_batch(
+                    images.detach(), boxes.detach(), labels.detach(),
+                    category_names, output_dir, epoch, batch_idx
+                )
         
         # Calculate training metrics
-        train_metrics = model.map_metric.compute()
+        train_metrics = model.get_metrics()
         avg_train_loss = train_loss / len(train_loader)
-        model.map_metric.reset()
         
         # Validation phase
         model.eval()
         val_loss = 0
+        model.map_metric.reset()
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
+            for batch in tqdm(data_module.val_dataloader(), desc="Validation"):
                 images = batch['image'].to(device)
                 flows = batch['flow'].to(device)
+                boxes = batch['boxes'].to(device)
                 labels = batch['labels'].to(device)
                 
-                with torch.cuda.amp.autocast():
-                    pred_boxes, pred_logits = model(images, flows)
-                    loss = model.loss_fn(pred_boxes, pred_logits, labels[..., 1:], labels[..., 0])
+                pred_boxes, pred_logits = model(images, flows)
+                loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)
                 
                 val_loss += loss.item()
-                
-                # Update metrics
-                predictions = []
-                targets = []
-                
-                for i in range(len(labels)):
-                    valid_mask = labels[i, :, 0] >= 0
-                    targets.append({
-                        'boxes': labels[i, valid_mask, 1:].cpu(),
-                        'labels': labels[i, valid_mask, 0].long().cpu()
-                    })
-                    
-                    scores = torch.softmax(pred_logits[i], dim=-1)
-                    max_scores, pred_labels = scores.max(dim=-1)
-                    
-                    conf_mask = max_scores > 0.05
-                    predictions.append({
-                        'boxes': pred_boxes[i][conf_mask].cpu(),
-                        'scores': max_scores[conf_mask].cpu(),
-                        'labels': pred_labels[conf_mask].cpu()
-                    })
-                
-                model.map_metric.update(predictions, targets)
+                model.update_metrics(pred_boxes, pred_logits, boxes, labels)
         
         # Calculate validation metrics
-        val_metrics = model.map_metric.compute()
-        avg_val_loss = val_loss / len(val_loader)
-        model.map_metric.reset()
+        val_metrics = model.get_metrics()
+        avg_val_loss = val_loss / len(data_module.val_dataloader())
         
         # Update metrics history
         metrics_history['train_loss'].append(avg_train_loss)
         metrics_history['val_loss'].append(avg_val_loss)
-        metrics_history['mAP50'].append(val_metrics['map_50'].item())
-        metrics_history['mAP50-95'].append(val_metrics['map'].item())
-        metrics_history['precision'].append(val_metrics['map_per_class'].mean().item())
-        metrics_history['recall'].append(val_metrics['mar_100'].item())
-        metrics_history['per_class_map'].append(val_metrics['map_per_class'].tolist())
+        metrics_history['mAP50'].append(val_metrics['mAP50'])
+        metrics_history['mAP50-95'].append(val_metrics['mAP50-95'])
+        metrics_history['precision'].append(val_metrics['precision'])
+        metrics_history['recall'].append(val_metrics['recall'])
+        metrics_history['per_class_map'].append(val_metrics['per_class_map'])
         
         # Log metrics
         logger.info(f"\nEpoch {epoch+1} Results:")
         logger.info(f"Training Loss: {avg_train_loss:.4f}")
         logger.info(f"Validation Loss: {avg_val_loss:.4f}")
-        logger.info(f"mAP50: {val_metrics['map_50']:.4f}")
-        logger.info(f"mAP50-95: {val_metrics['map']:.4f}")
-        logger.info(f"Precision: {val_metrics['map_per_class'].mean():.4f}")
-        logger.info(f"Recall: {val_metrics['mar_100']:.4f}")
+        logger.info(f"mAP50: {val_metrics['mAP50']:.4f}")
+        logger.info(f"mAP50-95: {val_metrics['mAP50-95']:.4f}")
+        
+        if args.use_wandb:
+            wandb.log({
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'mAP50': val_metrics['mAP50'],
+                'mAP50-95': val_metrics['mAP50-95'],
+                'precision': val_metrics['precision'],
+                'recall': val_metrics['recall']
+            })
         
         # Save best model
-        if val_metrics['map_50'] > best_map50:
-            best_map50 = val_metrics['map_50']
+        if val_metrics['mAP50'] > best_map50:
+            best_map50 = val_metrics['mAP50']
             save_path = output_dir / 'best_model.pt'
+            
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
                 'metrics': val_metrics,
-                'config': config,
+                'args': args,
             }, str(save_path))
+            
             logger.info(f"Saved new best model with mAP50: {best_map50:.4f}")
+        
+        # Save checkpoint
+        if (epoch + 1) % args.checkpoint_interval == 0:
+            checkpoint_path = output_dir / f'checkpoint_epoch{epoch+1}.pt'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'metrics': val_metrics,
+                'args': args,
+            }, str(checkpoint_path))
         
         # Save metrics history
         torch.save(metrics_history, output_dir / 'metrics_history.pt')
-        
-        # Plot metrics
-        plot_metrics(metrics_history, output_dir / 'metrics.png', config)
-    
-    return model, metrics_history
-
-def plot_metrics(metrics_history, save_path, config):
-    """Plot training metrics"""
-    plt.figure(figsize=(15, 10))
-    
-    # Plot losses
-    plt.subplot(2, 2, 1)
-    plt.plot(metrics_history['train_loss'], label='Train')
-    plt.plot(metrics_history['val_loss'], label='Val')
-    plt.title('Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    # Plot mAP
-    plt.subplot(2, 2, 2)
-    plt.plot(metrics_history['mAP50'], label='mAP50')
-    plt.plot(metrics_history['mAP50-95'], label='mAP50-95')
-    plt.title('Mean Average Precision')
-    plt.xlabel('Epoch')
-    plt.ylabel('mAP')
-    plt.legend()
-    
-    # Plot precision
-    plt.subplot(2, 2, 3)
-    plt.plot(metrics_history['precision'])
-    plt.title('Average Precision')
-    plt.xlabel('Epoch')
-    plt.ylabel('Precision')
-    
-    # Plot recall
-    plt.subplot(2, 2, 4)
-    plt.plot(metrics_history['recall'])
-    plt.title('Average Recall')
-    plt.xlabel('Epoch')
-    plt.ylabel('Recall')
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
 
 def main():
     parser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
-    pparser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
-    parser.add_argument('--data', type=str, required=True,
-                      help='Path to data.yaml file')
+    
+    # Dataset arguments
     parser.add_argument('--dataset-dir', type=str, required=True,
-                      help='Path to dataset root directory (containing data/, flow/, coco.json)')
+                      help='Path to dataset directory containing data/, flow/, and coco.json')
     parser.add_argument('--split-ratio', type=float, default=0.8,
-                      help='Train/val split ratio')
+                      help='Train/validation split ratio')
+    
+    # Training parameters
     parser.add_argument('--batch-size', type=int, default=8,
                       help='Batch size')
-    parser.add_argument('--img-size', type=int, default=416,
-                      help='Input image size')
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--epochs', type=int, default=100,
                       help='Number of epochs')
+    parser.add_argument('--learning-rate', type=float, default=1e-4,
+                      help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
+                      help='Weight decay')
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                      help='Gradient clipping value')
+    
+    # Model parameters
+    parser.add_argument('--image-size', type=int, default=416,
+                      help='Input image size')
+    parser.add_argument('--num-queries', type=int, default=100,
+                      help='Number of object queries')
+    
+    # System parameters
+    parser.add_argument('--num-workers', type=int, default=4,
+                      help='Number of dataloader workers')
     parser.add_argument('--output-dir', type=str, default='runs/train',
                       help='Output directory')
-    parser.add_argument('--num-workers', type=int, default=2,
-                      help='Number of dataloader workers')
+    parser.add_argument('--checkpoint-interval', type=int, default=10,
+                      help='Save checkpoint every N epochs')
+    parser.add_argument('--viz-interval', type=int, default=50,
+                      help='Visualize predictions every N batches')
+    
+    # Additional features
+    parser.add_argument('--resume', type=str, default=None,
+                      help='Path to checkpoint to resume from')
+    parser.add_argument('--use-wandb', action='store_true',
+                      help='Use Weights & Biases for logging')
+    parser.add_argument('--seed', type=int, default=42,
+                      help='Random seed')
     
     args = parser.parse_args()
     
-    # Load config
-    config = yaml.safe_load(open(args.data))
+    # Set random seed
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
     
-    # Update config
-    config.update({
-        'batch_size': args.batch_size,
-        'epochs': args.epochs,
-        'img_size': args.img_size,
-    })
-    
-    # Setup paths
-    dataset_dir = Path(args.dataset_dir)
-    images_dir = dataset_dir / 'data'
-    coco_file = dataset_dir / 'coco.json'
-    
-    # Verify paths
-    if not images_dir.exists():
-        raise ValueError(f"Images directory not found: {images_dir}")
-    if not coco_file.exists():
-        raise ValueError(f"COCO annotations file not found: {coco_file}")
-    
-    print(f"Dataset directory: {dataset_dir}")
-    print(f"Images directory: {images_dir}")
-    print(f"COCO annotations: {coco_file}")
-    
-    # Create datasets
-    train_dataset = EnhancedObjectDetectionDataset(
-        image_dir=images_dir,
-        annotation_file=coco_file,
-        split='train',
-        split_ratio=args.split_ratio,
-        image_size=args.img_size,
-        num_classes=config['nc']
-    )
-    
-    val_dataset = EnhancedObjectDetectionDataset(
-        image_dir=images_dir,
-        annotation_file=coco_file,
-        split='val',
-        split_ratio=args.split_ratio,
-        image_size=args.img_size,
-        num_classes=config['nc']
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    
-    # Create and train model
-    model = EnhancedDetectionModel(num_classes=config['nc'])
-    model, metrics_history = train_model(model, train_loader, val_loader, config, args.output_dir)
+    train_model(args)
 
 if __name__ == '__main__':
     main()

@@ -75,11 +75,15 @@ class MultiScaleTransformer(nn.Module):
         super().__init__()
         self.d_model = d_model
         
-        # Position embeddings for different scales
-        self.pos_embeddings = nn.ModuleList([
-            nn.Parameter(torch.zeros(1, d_model, size, size))
+        # Create position embedding modules properly
+        self.pos_embeddings = nn.ModuleDict({
+            f'scale_{size}': nn.Parameter(torch.zeros(1, d_model, size, size))
             for size in [64, 32, 16, 8]
-        ])
+        })
+        
+        # Initialize position embeddings
+        for embed in self.pos_embeddings.values():
+            nn.init.normal_(embed, mean=0, std=0.02)
         
         # Scale-specific transformers
         self.transformers = nn.ModuleList([
@@ -100,7 +104,11 @@ class MultiScaleTransformer(nn.Module):
     def forward(self, features):
         outputs = []
         
-        for idx, (feature, pos_embed, transformer) in enumerate(zip(features, self.pos_embeddings, self.transformers)):
+        for idx, (feature, (_, pos_embed), transformer) in enumerate(zip(
+            features, 
+            self.pos_embeddings.items(), 
+            self.transformers
+        )):
             B, C, H, W = feature.shape
             
             # Add positional encoding
@@ -127,7 +135,6 @@ class MultiScaleTransformer(nn.Module):
         ]
         
         return sum(w * out for w, out in zip(weights, scaled_outputs))
-
 class EnhancedDetectionModel(nn.Module):
     def __init__(self, num_classes, num_queries=100):
         super().__init__()

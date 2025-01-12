@@ -218,9 +218,7 @@ class EnhancedDetectionModel(nn.Module):
         l1_loss_weight = 5.0
         cls_loss_weight = 1.0
 
-        total_giou_loss = 0
-        total_l1_loss = 0
-        total_cls_loss = 0
+        batch_total_loss = torch.tensor(0., device=device, requires_grad=True)
         num_boxes = 0
 
         for i in range(B):
@@ -230,12 +228,14 @@ class EnhancedDetectionModel(nn.Module):
             batch_target_labels = target_labels[i][valid_mask]
 
             if len(batch_target_boxes) == 0:
+                # Add small loss for empty targets to maintain gradient flow
+                batch_total_loss = batch_total_loss + pred_boxes[i].sum() * 0.0 + pred_logits[i].sum() * 0.0
                 continue
 
             # Calculate IoU between all predictions and targets
             iou_matrix = self.box_iou(pred_boxes[i], batch_target_boxes)  # [num_queries, num_targets]
         
-            # Hungarian matching to find best prediction-target pairs
+            # Hungarian matching
             cost_matrix = -iou_matrix
             pred_indices, target_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
             pred_indices = torch.as_tensor(pred_indices, dtype=torch.long, device=device)
@@ -246,19 +246,19 @@ class EnhancedDetectionModel(nn.Module):
             matched_target_boxes = batch_target_boxes[target_indices]
         
             # GIoU Loss
-            giou_loss = 1 - torch.diag(self.generalized_box_iou(
+            giou_loss = (1 - torch.diag(self.generalized_box_iou(
                 matched_pred_boxes, matched_target_boxes
-            )).mean()
+            ))).mean()
 
             # L1 Loss
             l1_loss = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='mean')
 
             # Classification Loss
             target_classes = torch.full(
-                (pred_logits[i].shape[0],), 
-                self.num_classes,  # background class
-                dtype=torch.long, 
-                device=device
+            (pred_logits[i].shape[0],), 
+            self.num_classes,  # background class
+            dtype=torch.long, 
+            device=device
             )
             target_classes[pred_indices] = batch_target_labels[target_indices]
         
@@ -268,24 +268,23 @@ class EnhancedDetectionModel(nn.Module):
                 reduction='mean'
             )
 
-            # Weighted sum of losses
-            total_giou_loss += giou_loss * giou_loss_weight
-            total_l1_loss += l1_loss * l1_loss_weight
-            total_cls_loss += cls_loss * cls_loss_weight
+            # Combine losses with weights
+            batch_loss = (
+            giou_loss * giou_loss_weight +
+            l1_loss * l1_loss_weight +
+            cls_loss * cls_loss_weight
+            )
+        
+            batch_total_loss = batch_total_loss + batch_loss
             num_boxes += len(pred_indices)
 
-            if i == 0:  # Print loss components for first batch item
-                print(f"\nLoss components - GIoU: {giou_loss.item():.4f}, "
-                      f"L1: {l1_loss.item():.4f}, "
-                      f"Class: {cls_loss.item():.4f}")
-
-        # Average losses
+        # Average loss over batches
         if num_boxes > 0:
-            total_loss = (total_giou_loss + total_l1_loss + total_cls_loss) / num_boxes
+            avg_loss = batch_total_loss / num_boxes
         else:
-            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            avg_loss = batch_total_loss
 
-        return total_loss
+        return avg_loss
     
     def generalized_box_iou(self, boxes1, boxes2):
         """

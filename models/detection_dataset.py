@@ -129,20 +129,22 @@ class EnhancedObjectDetectionDataset(Dataset):
                 ),
                 ToTensorV2()
             ], bbox_params=A.BboxParams(
-                format='coco',
-                label_fields=['category_ids']
+            format='coco',
+            label_fields=['category_ids'],
+            min_visibility=0.3
             ))
         else:
             return A.Compose([
-                A.Resize(self.image_size, self.image_size),
-                A.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
-                ToTensorV2()
-            ], bbox_params=A.BboxParams(
-                format='coco',
-                label_fields=['category_ids']
+            A.Resize(self.image_size, self.image_size),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            ToTensorV2()
+        ], bbox_params=A.BboxParams(
+            format='coco',
+            label_fields=['category_ids']
+        ))
             ))
     
     def __len__(self):
@@ -183,7 +185,7 @@ class EnhancedObjectDetectionDataset(Dataset):
             boxes.append(obj['bbox'])
             labels.append(obj['category_id'])
         
-        if not boxes:
+        if len(boxes) == 0:
             boxes = np.zeros((0, 4), dtype=np.float32)
             labels = np.zeros(0, dtype=np.int64)
         else:
@@ -198,14 +200,24 @@ class EnhancedObjectDetectionDataset(Dataset):
         )
         
         image = transformed['image']
-        boxes = np.array(transformed['bboxes']) if transformed['bboxes'] else np.zeros((0, 4))
-        labels = np.array(transformed['category_ids']) if transformed['category_ids'] else np.zeros(0)
+        
+        # Handle transformed boxes safely
+        transformed_bboxes = transformed.get('bboxes', [])
+        transformed_category_ids = transformed.get('category_ids', [])
+        
+        # Convert to numpy arrays with proper handling of empty case
+        if len(transformed_bboxes) == 0:
+            boxes = np.zeros((0, 4), dtype=np.float32)
+            labels = np.zeros(0, dtype=np.int64)
+        else:
+            boxes = np.array(transformed_bboxes, dtype=np.float32)
+            labels = np.array(transformed_category_ids, dtype=np.int64)
         
         # Convert flow
         flow = torch.from_numpy(flow.transpose(2, 0, 1))
         
         # Convert boxes to cxcywh format
-        if len(boxes) > 0:
+        if boxes.shape[0] > 0:
             boxes = self._convert_to_cxcywh(boxes)
         else:
             boxes = torch.zeros((0, 4))

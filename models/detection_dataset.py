@@ -122,7 +122,6 @@ class EnhancedObjectDetectionDataset(Dataset):
                 A.GaussianBlur(),
                 A.MotionBlur()
             ], p=0.2),
-            A.Resize(self.image_size, self.image_size),
             A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225]
@@ -135,7 +134,6 @@ class EnhancedObjectDetectionDataset(Dataset):
         ))
         else:
             return A.Compose([
-            A.Resize(self.image_size, self.image_size),
             A.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225]
@@ -154,6 +152,8 @@ class EnhancedObjectDetectionDataset(Dataset):
         flow_path = self.image_dir.parent / 'flow' / f"{img_path.stem}_flow.npy"
         try:
             flow = np.load(str(flow_path))
+            # Resize flow to match image_size
+            flow = cv2.resize(flow, (self.image_size, self.image_size))
             return flow.astype(np.float32)
         except Exception as e:
             self.logger.warning(f"Error loading flow {flow_path}: {str(e)}")
@@ -170,6 +170,9 @@ class EnhancedObjectDetectionDataset(Dataset):
             if image is None:
                 raise ValueError(f"Could not load image: {img_path}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Resize image to target size
+            image = cv2.resize(image, (self.image_size, self.image_size))
         except Exception as e:
             self.logger.error(f"Error loading image {img_path}: {str(e)}")
             raise
@@ -181,7 +184,17 @@ class EnhancedObjectDetectionDataset(Dataset):
         boxes = []
         labels = []
         for obj in img_info['objects']:
-            boxes.append(obj['bbox'])
+            # Scale boxes according to resize ratio
+            orig_h, orig_w = img_info['height'], img_info['width']
+            x, y, w, h = obj['bbox']
+            
+            # Convert to relative coordinates
+            x = x / orig_w
+            y = y / orig_h
+            w = w / orig_w
+            h = h / orig_h
+            
+            boxes.append([x, y, w, h])
             labels.append(obj['category_id'])
         
         if len(boxes) == 0:
@@ -212,7 +225,7 @@ class EnhancedObjectDetectionDataset(Dataset):
             boxes = np.array(transformed_bboxes, dtype=np.float32)
             labels = np.array(transformed_category_ids, dtype=np.int64)
         
-        # Convert flow
+        # Convert flow to tensor and ensure correct shape
         flow = torch.from_numpy(flow.transpose(2, 0, 1))
         
         # Convert boxes to cxcywh format
@@ -241,6 +254,7 @@ class EnhancedObjectDetectionDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function for dataloader"""
+    # All images and flows should already be the same size due to resize in __getitem__
     images = torch.stack([item['image'] for item in batch])
     flows = torch.stack([item['flow'] for item in batch])
     
@@ -259,7 +273,8 @@ def collate_fn(batch):
                 boxes[idx, :len(item['boxes'])] = item['boxes']
                 labels[idx, :len(item['labels'])] = item['labels']
     
-    return {
+    # Create batch
+    batch_dict = {
         'image': images,
         'flow': flows,
         'boxes': boxes,
@@ -267,7 +282,9 @@ def collate_fn(batch):
         'img_ids': [item['img_id'] for item in batch],
         'img_paths': [item['img_path'] for item in batch]
     }
-
+    
+    return batch_dict
+    
 class DataModule:
     """Data module to handle all data-related operations"""
     def __init__(
@@ -282,7 +299,12 @@ class DataModule:
     ):
         self.dataset_dir = Path(dataset_dir)
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        
+        # Adjust number of workers based on system CPU count
+        cpu_count = os.cpu_count()
+        suggested_workers = max(1, (cpu_count or 2) - 1)  # Leave one CPU free
+        self.num_workers = min(num_workers, suggested_workers)
+        
         self.image_size = image_size
         self.split_ratio = split_ratio
         self.augment = augment

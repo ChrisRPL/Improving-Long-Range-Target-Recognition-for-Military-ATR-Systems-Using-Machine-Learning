@@ -259,12 +259,11 @@ def plot_metrics(metrics_history, save_path, config):
 
 def main():
     parser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
+    pparser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
     parser.add_argument('--data', type=str, required=True,
                       help='Path to data.yaml file')
-    parser.add_argument('--images-dir', type=str, required=True,
-                      help='Path to directory containing all images')
-    parser.add_argument('--coco-file', type=str, required=True,
-                      help='Path to COCO annotation file')
+    parser.add_argument('--dataset-dir', type=str, required=True,
+                      help='Path to dataset root directory (containing data/, flow/, coco.json)')
     parser.add_argument('--split-ratio', type=float, default=0.8,
                       help='Train/val split ratio')
     parser.add_argument('--batch-size', type=int, default=8,
@@ -290,10 +289,25 @@ def main():
         'img_size': args.img_size,
     })
     
+    # Setup paths
+    dataset_dir = Path(args.dataset_dir)
+    images_dir = dataset_dir / 'data'
+    coco_file = dataset_dir / 'coco.json'
+    
+    # Verify paths
+    if not images_dir.exists():
+        raise ValueError(f"Images directory not found: {images_dir}")
+    if not coco_file.exists():
+        raise ValueError(f"COCO annotations file not found: {coco_file}")
+    
+    print(f"Dataset directory: {dataset_dir}")
+    print(f"Images directory: {images_dir}")
+    print(f"COCO annotations: {coco_file}")
+    
     # Create datasets
     train_dataset = EnhancedObjectDetectionDataset(
-        image_dir=args.images_dir,
-        annotation_file=args.coco_file,
+        image_dir=images_dir,
+        annotation_file=coco_file,
         split='train',
         split_ratio=args.split_ratio,
         image_size=args.img_size,
@@ -301,8 +315,8 @@ def main():
     )
     
     val_dataset = EnhancedObjectDetectionDataset(
-        image_dir=args.images_dir,
-        annotation_file=args.coco_file,
+        image_dir=images_dir,
+        annotation_file=coco_file,
         split='val',
         split_ratio=args.split_ratio,
         image_size=args.img_size,

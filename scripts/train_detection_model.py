@@ -15,6 +15,10 @@ import json
 from models.detection_model import EnhancedDetectionModel
 from models.detection_dataset import DataModule
 
+import sys
+
+sys.path.append(str(Path(__file__).parent.parent))
+
 def setup_logger(output_dir):
     """Setup logger with file and console handlers"""
     logger = logging.getLogger('training')

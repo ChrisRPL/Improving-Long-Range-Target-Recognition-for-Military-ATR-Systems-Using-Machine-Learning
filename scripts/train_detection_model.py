@@ -69,7 +69,7 @@ def train_model(model, train_loader, val_loader, config, output_dir):
     
     # Setup optimizer and scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
-    scaler = torch.amp.GradScaler(device_type='cuda')
+    scaler = torch.cuda.amp.GradScaler()
     
     # Initialize metrics
     best_map50 = 0

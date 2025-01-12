@@ -59,7 +59,7 @@ class EnhancedObjectDetectionDataset(Dataset):
         for img in self.coco['images']:
             if img['id'] in self.image_ids:
                 self.annotations[img['id']] = {
-                    'file_name': img['file_name'],
+                    'file_name': img['file_name'].replace("data/", ""),
                     'width': img['width'],
                     'height': img['height'],
                     'objects': []
@@ -91,7 +91,7 @@ class EnhancedObjectDetectionDataset(Dataset):
         missing_flows = []
         
         for img_id in self.image_ids:
-            img_path = self.image_dir / self.annotations[img_id]['file_name']
+            img_path = self.image_dir / self.annotations[img_id]['file_name'].replace("data/", "")
             flow_path = self.image_dir.parent / 'flow' / f"{img_path.stem}_flow.npy"
             
             if not img_path.exists():

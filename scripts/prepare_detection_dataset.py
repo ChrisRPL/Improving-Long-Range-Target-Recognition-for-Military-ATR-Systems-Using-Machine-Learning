@@ -77,12 +77,12 @@ def prepare_optical_flow(dataset_root: Path, batch_size: int = 100):
     dataset_root = Path(dataset_root)
     print(f"Processing dataset at: {dataset_root}")
     
-    for split in ['train', 'valid', 'test']:
+    for split in ['data']:
         print(f"\nProcessing {split} split...")
         
         # Setup paths
-        images_dir = dataset_root / split / 'images'
-        flow_dir = dataset_root / split / 'flow'
+        images_dir = dataset_root / split 
+        flow_dir = dataset_root / 'flow'
         
         if not images_dir.exists():
             print(f"Images directory not found: {images_dir}")

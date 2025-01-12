@@ -187,56 +187,69 @@ class EnhancedDetectionModel(nn.Module):
        
        return tv_box_iou(boxes1_xyxy, boxes2_xyxy)
 
-   def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
-       """
-       Calculate loss
-       Args:
-           pred_boxes: [B, num_queries, 4] predicted boxes
-           pred_logits: [B, num_queries, num_classes+1] predicted logits
-           target_boxes: [B, max_objects, 4] ground truth boxes 
-           target_labels: [B, max_objects] ground truth labels
-       Returns:
-           total_loss: scalar loss value
-       """
-       B = pred_boxes.shape[0]
-       device = pred_boxes.device
-       total_loss = torch.tensor(0.0, device=device)
+  def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
+    """
+    Calculate loss
+    Args:
+        pred_boxes: [B, num_queries, 4] predicted boxes
+        pred_logits: [B, num_queries, num_classes+1] predicted logits
+        target_boxes: [B, max_objects, 4] ground truth boxes 
+        target_labels: [B, max_objects] ground truth labels
+    Returns:
+        total_loss: scalar loss value
+    """
+    B = pred_boxes.shape[0]
+    device = pred_boxes.device
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    box_loss_weight = 5.0  # weight for box loss
+    cls_loss_weight = 2.0  # weight for classification loss
 
-       # Verify shapes
-       assert pred_boxes.shape[0] == pred_logits.shape[0] == target_boxes.shape[0] == target_labels.shape[0]
-       
-       for i in range(B):
-           # Get valid targets (remove padding)
-           valid_mask = target_labels[i] >= 0
-           batch_target_boxes = target_boxes[i][valid_mask]
-           batch_target_labels = target_labels[i][valid_mask]
-           
-           if len(batch_target_boxes) == 0:
-               # Handle empty targets
-               total_loss = total_loss + pred_boxes[i].sum() * 0.0
-               continue
-           
-           # Classification loss with padded targets
-           num_valid_targets = len(batch_target_labels)
-           padded_labels = torch.cat([
-               batch_target_labels,
-               torch.zeros(self.num_queries - num_valid_targets, device=device)
-           ]).long()
-           
-           cls_loss = F.cross_entropy(pred_logits[i], padded_labels)
-           
-           # Box loss (GIoU)
-           valid_pred_boxes = pred_boxes[i][:num_valid_targets]
-           if len(batch_target_boxes) > 0:
-               iou = self.box_iou(valid_pred_boxes, batch_target_boxes)
-               max_iou, _ = iou.max(dim=1)
-               box_loss = (1 - max_iou).mean()
-           else:
-               box_loss = valid_pred_boxes.sum() * 0.0
-           
-           total_loss = total_loss + (cls_loss + box_loss)
-       
-       return total_loss / B
+    for i in range(B):
+        # Get valid targets (remove padding)
+        valid_mask = target_labels[i] >= 0
+        batch_target_boxes = target_boxes[i][valid_mask]
+        batch_target_labels = target_labels[i][valid_mask]
+        
+        if len(batch_target_boxes) == 0:
+            # Add a small loss for empty targets to maintain gradient flow
+            total_loss = total_loss + pred_boxes[i].sum() * 0.01
+            continue
+        
+        # Box loss (GIoU Loss)
+        iou = self.box_iou(pred_boxes[i], batch_target_boxes)  # [num_queries, num_targets]
+        
+        # For each predicted box, get the target with maximum IoU
+        max_iou, matched_idx = iou.max(dim=1)  # [num_queries]
+        
+        # Calculate GIoU Loss
+        box_loss = (1 - max_iou).mean() * box_loss_weight
+        
+        # Classification loss
+        # Match predictions with targets based on IoU
+        matched_labels = batch_target_labels[matched_idx]
+        
+        # Create classification targets with background
+        cls_targets = torch.full((pred_logits[i].shape[0],), self.num_classes, 
+                               dtype=torch.long, device=device)  # Default to background class
+        
+        # Assign matched labels where IoU is above threshold
+        positive_mask = max_iou > 0.5
+        cls_targets[positive_mask] = matched_labels[positive_mask]
+        
+        # Calculate classification loss
+        cls_loss = F.cross_entropy(pred_logits[i], cls_targets) * cls_loss_weight
+        
+        # Add losses for this batch item
+        batch_loss = box_loss + cls_loss
+        total_loss = total_loss + batch_loss
+        
+        # Print loss components for debugging
+        if i == 0:  # Print only for first item in batch
+            print(f"\nLoss components - Box: {box_loss.item():.4f}, Class: {cls_loss.item():.4f}")
+    
+    avg_loss = total_loss / B
+    return avg_loss
 
    def update_metrics(self, pred_boxes, pred_logits, targets):
        """Update evaluation metrics"""

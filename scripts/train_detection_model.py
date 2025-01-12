@@ -92,13 +92,14 @@ def train_model(model, train_loader, val_loader, config, output_dir):
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config["epochs"]}')
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Move data to device
             images = batch['image'].to(device)
             flows = batch['flow'].to(device)
             labels = batch['labels'].to(device)
             
-            # Mixed precision training
-            with torch.amp.autocast(device_type='cuda'):
+            # Ensure optimizer gradients are zero
+            optimizer.zero_grad(set_to_none=False)
+            
+            with torch.cuda.amp.autocast():
                 # Forward pass
                 pred_boxes, pred_logits = model(images, flows)
                 
@@ -109,21 +110,27 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                     labels[..., 1:],  # bbox coordinates
                     labels[..., 0]    # class labels
                 )
+                
+                # Print gradients for debugging
+                if batch_idx % 50 == 0:
+                    print(f"\nLoss value: {loss.item()}")
+            
+            # Check if loss requires grad
+            if not loss.requires_grad:
+                print("Warning: Loss does not require gradients!")
             
             # Backward pass
-            optimizer.zero_grad()
             scaler.scale(loss).backward()
+            
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            
+            # Optimizer step
             scaler.step(optimizer)
             scaler.update()
             
             # Update metrics
             total_loss += loss.item()
-            
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
-            })
             
             # Update training metrics
             target_list = []
@@ -145,6 +152,12 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                 })
             
             model.map_metric.update(pred_list, target_list)
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
+            })
         
         avg_loss = total_loss / len(train_loader)
         
@@ -161,7 +174,7 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                 flows = batch['flow'].to(device)
                 labels = batch['labels'].to(device)
                 
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.cuda.amp.autocast():
                     pred_boxes, pred_logits = model(images, flows)
                     loss = model.loss_fn(
                         pred_boxes,
@@ -216,11 +229,23 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
                 'metrics': metrics,
+                'config': config,
             }, str(output_dir / 'best_model.pt'))
             print(f"Saved new best model with mAP50: {best_map50:.4f}")
         
-        # Save latest metrics
+        # Save latest model
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'metrics': metrics,
+            'config': config,
+        }, str(output_dir / 'last_model.pt'))
+        
+        # Save metrics history
         torch.save(metrics_history, str(output_dir / 'metrics_history.pt'))
 
     return model, metrics_history

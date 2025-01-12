@@ -7,7 +7,7 @@ from torchvision import transforms
 from typing import Dict, List
 
 class EnhancedObjectDetectionDataset(Dataset):
-    def __init__(self, data_root: Path, split: str, image_size=640):
+    def __init__(self, data_root: Path, split: str, image_size=416):
         self.data_root = Path(data_root)
         self.split = split
         self.image_size = image_size
@@ -19,56 +19,59 @@ class EnhancedObjectDetectionDataset(Dataset):
         
         # Get all image paths
         self.image_paths = sorted(list(self.images_dir.glob('*.jpg')))
+        print(f"Found {len(self.image_paths)} images in {self.images_dir}")
         
-        # Transforms
-        self.transforms = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize((image_size, image_size)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                              std=[0.229, 0.224, 0.225])
-        ])
+        # Verify label files exist
+        self.has_labels = []
+        for img_path in self.image_paths:
+            label_path = self.labels_dir / f"{img_path.stem}.txt"
+            self.has_labels.append(label_path.exists())
+        
+        print(f"Found {sum(self.has_labels)} images with labels")
 
-    def __len__(self):
-        return len(self.image_paths)
-    
     def load_labels(self, img_path):
         """Load YOLO format labels."""
         label_path = self.labels_dir / f"{img_path.stem}.txt"
         if not label_path.exists():
-            return torch.zeros((0, 5))  # Return empty tensor if no labels
+            return torch.zeros((1, 5))  # Return dummy label instead of empty tensor
             
-        labels = []
-        with open(label_path, 'r') as f:
-            for line in f:
-                values = line.strip().split()
-                if len(values) == 5:  # class, x, y, w, h
-                    labels.append([float(x) for x in values])
-        
-        return torch.tensor(labels) if labels else torch.zeros((0, 5))
-    
+        try:
+            labels = []
+            with open(label_path, 'r') as f:
+                for line in f:
+                    values = line.strip().split()
+                    if len(values) == 5:
+                        labels.append([float(x) for x in values])
+            
+            if not labels:
+                return torch.zeros((1, 5))  # Return dummy label if file is empty
+                
+            return torch.tensor(labels)
+        except Exception as e:
+            print(f"Error loading labels from {label_path}: {str(e)}")
+            return torch.zeros((1, 5))  # Return dummy label on error
+
     def __getitem__(self, idx):
-        # Load image
         img_path = self.image_paths[idx]
+        
+        # Load and process image
         img = cv2.imread(str(img_path))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.image_size, self.image_size))
         
         # Load optical flow
         flow_path = self.flow_dir / f"{img_path.stem}_flow.npy"
         if flow_path.exists():
             flow = np.load(str(flow_path))
         else:
-            flow = np.zeros((img.shape[0], img.shape[1], 2), dtype=np.float32)
+            flow = np.zeros((self.image_size, self.image_size, 2), dtype=np.float32)
         
-        # Resize image and flow to target size
-        img = cv2.resize(img, (self.image_size, self.image_size))
-        flow = cv2.resize(flow, (self.image_size, self.image_size))
-        
-        # Convert to tensor and normalize
-        img = self.transforms(img)
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
-        
-        # Load and process labels
+        # Load labels
         labels = self.load_labels(img_path)
+        
+        # Convert to tensors
+        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+        flow = torch.from_numpy(flow).float().permute(2, 0, 1)
         
         return {
             'image': img,

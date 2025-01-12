@@ -146,6 +146,11 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                         print(f"Flows shape: {flows.shape}")
                         print(f"Labels shape: {labels.shape}")
                         print(f"Sample labels:\n{labels[0]}")
+            
+                       # Add additional checks
+                       print(f"Label statistics:")
+                       print(f"Unique label values: {torch.unique(labels)}")
+                       print(f"Number of non-zero labels: {(labels != 0).sum()}")
                     
                     # Zero gradients
                     optimizer.zero_grad(set_to_none=False)

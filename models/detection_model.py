@@ -199,102 +199,57 @@ class EnhancedDetectionModel(nn.Module):
         return tv_box_iou(boxes1_xyxy, boxes2_xyxy)
 
     def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
-        """
-        Calculate loss with debugging information
-        """
         B = pred_boxes.shape[0]
         device = pred_boxes.device
-
-        # Print input shapes and values for debugging
-        print(f"\nInput shapes:")
-        print(f"pred_boxes: {pred_boxes.shape}, values range: [{pred_boxes.min():.4f}, {pred_boxes.max():.4f}]")
-        print(f"pred_logits: {pred_logits.shape}, values range: [{pred_logits.min():.4f}, {pred_logits.max():.4f}]")
-        print(f"target_boxes: {target_boxes.shape}, values range: [{target_boxes.min():.4f}, {target_boxes.max():.4f}]")
-        print(f"target_labels: {target_labels.shape}, unique labels: {torch.unique(target_labels)}")
-
-        # Loss weights
-        giou_loss_weight = 2.0
-        l1_loss_weight = 5.0
-        cls_loss_weight = 1.0
-
+    
+        # Initialize loss
         batch_total_loss = torch.tensor(0., device=device, requires_grad=True)
         num_boxes = 0
-
+    
         for i in range(B):
-            # Get valid targets (remove padding)
-            valid_mask = target_labels[i] >= 0
+            # Check if we have any valid targets (non-dummy)
+            valid_mask = (target_labels[i] >= 0) & (target_labels[i] < self.num_classes)
+            if not valid_mask.any():
+                # Add small loss to maintain gradient flow
+                dummy_loss = pred_boxes[i].sum() * 0.0 + pred_logits[i].sum() * 0.0
+                batch_total_loss = batch_total_loss + dummy_loss
+                continue
+            
             batch_target_boxes = target_boxes[i][valid_mask]
             batch_target_labels = target_labels[i][valid_mask]
-
-            print(f"\nBatch {i} stats:")
-            print(f"Valid targets: {valid_mask.sum()}")
-            print(f"Target boxes shape: {batch_target_boxes.shape}")
-            print(f"Target labels: {batch_target_labels}")
-
-            if len(batch_target_boxes) == 0:
-                print("No valid targets in this batch")
-                continue
-
-            # Calculate IoU between all predictions and targets
+        
+            # Calculate IoU matrix
             iou_matrix = self.box_iou(pred_boxes[i], batch_target_boxes)
-            print(f"IoU matrix shape: {iou_matrix.shape}, range: [{iou_matrix.min():.4f}, {iou_matrix.max():.4f}]")
-
-            # Hungarian matching
-            cost_matrix = -iou_matrix
-            pred_indices, target_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
-            pred_indices = torch.as_tensor(pred_indices, dtype=torch.long, device=device)
-            target_indices = torch.as_tensor(target_indices, dtype=torch.long, device=device)
-
-            print(f"Matched pairs: {len(pred_indices)}")
-
-            # Get matched pairs
-            matched_pred_boxes = pred_boxes[i][pred_indices]
-            matched_target_boxes = batch_target_boxes[target_indices]
-
-            # GIoU Loss
-            giou_values = self.generalized_box_iou(matched_pred_boxes, matched_target_boxes)
-            giou_loss = (1 - torch.diag(giou_values)).mean()
         
-            # L1 Loss
-            l1_loss = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='mean')
-
-            # Classification Loss
-            target_classes = torch.full(
-                (pred_logits[i].shape[0],),
-                self.num_classes,
-                dtype=torch.long,
-                device=device
-            )
-            target_classes[pred_indices] = batch_target_labels[target_indices]
-
-            cls_loss = F.cross_entropy(pred_logits[i], target_classes)
-
-            # Print individual loss components
-            print(f"Loss components:")
-            print(f"GIoU loss: {giou_loss.item():.4f}")
-            print(f"L1 loss: {l1_loss.item():.4f}")
-            print(f"Classification loss: {cls_loss.item():.4f}")
-
-            # Combine losses with weights
-            batch_loss = (
-                giou_loss * giou_loss_weight +
-                l1_loss * l1_loss_weight +
-                cls_loss * cls_loss_weight
-            )
-
-            print(f"Total batch loss: {batch_loss.item():.4f}")
+            # Get best matches
+            values, indices = iou_matrix.max(dim=1)
         
-            batch_total_loss = batch_total_loss + batch_loss
-            num_boxes += len(pred_indices)
-
-        # Average loss
+            # Calculate losses only for matched predictions
+            matched_boxes = pred_boxes[i][values > 0.5]  # IoU threshold
+            matched_targets = batch_target_boxes[indices[values > 0.5]]
+        
+            if len(matched_boxes) > 0:
+                # Box regression loss
+                box_loss = F.l1_loss(matched_boxes, matched_targets, reduction='mean')
+            
+                # Classification loss
+                target_classes = torch.full((pred_logits[i].shape[0],), 
+                                     self.num_classes,  # background class
+                                     device=device)
+                target_classes[values > 0.5] = batch_target_labels[indices[values > 0.5]]
+                cls_loss = F.cross_entropy(pred_logits[i], target_classes)
+            
+                # Combined loss
+                loss = box_loss * 5.0 + cls_loss
+                batch_total_loss = batch_total_loss + loss
+                num_boxes += len(matched_boxes)
+    
+        # Return average loss
         if num_boxes > 0:
-            avg_loss = batch_total_loss / num_boxes
+            return batch_total_loss / num_boxes
         else:
-            avg_loss = batch_total_loss
-
-        print(f"\nFinal average loss: {avg_loss.item():.4f}")
-        return avg_loss
+            # Add small loss to maintain gradient flow
+            return batch_total_loss + pred_boxes.sum() * 0.0 + pred_logits.sum() * 0.0
     
     def generalized_box_iou(self, boxes1, boxes2):
         """

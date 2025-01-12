@@ -88,7 +88,7 @@ class EnhancedObjectDetectionDataset(Dataset):
         for img in self.coco['images']:
             if img['id'] in self.image_ids:
                 self.annotations[img['id']] = {
-                    'file_name': img['file_name'],
+                    'file_name': img['file_name'].replace("data/", ""),
                     'width': img['width'],
                     'height': img['height'],
                     'objects': []
@@ -132,7 +132,7 @@ class EnhancedObjectDetectionDataset(Dataset):
         """Verify all image files exist"""
         missing_images = []
         for img_id in self.image_ids:
-            img_path = self.image_dir / self.annotations[img_id]['file_name']
+            img_path = self.image_dir / self.annotations[img_id]['file_name'].replace("data/", "")
             if not img_path.exists():
                 missing_images.append(str(img_path))
         

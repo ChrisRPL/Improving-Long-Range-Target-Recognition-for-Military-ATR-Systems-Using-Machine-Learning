@@ -10,7 +10,7 @@ from torchvision import transforms
 import os
 import warnings
 from typing import Dict, List
-from models.detection_dataset import EnhancedObjectDetectionDataset
+from models.detection_dataset import EnhancedObjectDetectionDataset, collate_fn
 from models.detection_model import EnhancedDetectionModel
 warnings.filterwarnings('ignore')
 import sys

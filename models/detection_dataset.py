@@ -7,10 +7,11 @@ from torchvision import transforms
 from typing import Dict, List
 
 class EnhancedObjectDetectionDataset(Dataset):
-    def __init__(self, data_root: Path, split: str, image_size=416):
+    def __init__(self, data_root: Path, split: str, image_size=416, num_classes=10):
         self.data_root = Path(data_root)
         self.split = split
         self.image_size = image_size
+        self.num_classes=num_classes
         
         # Setup paths
         self.images_dir = self.data_root / split / 'images'

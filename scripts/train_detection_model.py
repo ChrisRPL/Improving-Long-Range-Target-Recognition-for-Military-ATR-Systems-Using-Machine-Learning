@@ -1,15 +1,17 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import yaml
 from tqdm import tqdm
 import argparse
+import cv2
+import numpy as np
+from torchvision import transforms
+import os
+import warnings
+from typing import Dict, List
+warnings.filterwarnings('ignore')
 import sys
-from models.detection_model import EnhancedDetectionModel
-from models.detection_dataset import EnhancedObjectDetectionDataset, collate_fn
-from torch.utils.data import Dataset, DataLoader
-import torch.amp as amp  # Updated import
-from scipy.optimize import linear_sum_assignment  # Add this import
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -20,31 +22,54 @@ def load_yaml(yaml_path):
     
     # Convert relative paths to absolute
     yaml_dir = Path(yaml_path).parent
-    if '../' in str(config['train']):
+    if '../' in str(config.get('train', '')):
         config['train'] = str(yaml_dir / config['train'])
-    if '../' in str(config['val']):
+    if '../' in str(config.get('val', '')):
         config['val'] = str(yaml_dir / config['val'])
-    if '../' in str(config['test']):
+    if '../' in str(config.get('test', '')):
         config['test'] = str(yaml_dir / config['test'])
     
     return config
 
+def collate_fn(batch: List[Dict]) -> Dict:
+    """Custom collate function to handle variable number of labels."""
+    images = torch.stack([item['image'] for item in batch])
+    flows = torch.stack([item['flow'] for item in batch])
+    
+    # Find max number of labels in batch
+    max_labels = max(item['labels'].shape[0] for item in batch)
+    
+    # Pad labels to max length
+    padded_labels = []
+    for item in batch:
+        num_labels = item['labels'].shape[0]
+        if num_labels == 0:
+            # Handle empty labels
+            padding = torch.full((max_labels, 5), -1)
+            padded_labels.append(padding)
+        else:
+            padding = torch.full((max_labels - num_labels, 5), -1)
+            padded = torch.cat([item['labels'], padding], dim=0)
+            padded_labels.append(padded)
+    
+    labels = torch.stack(padded_labels)
+    
+    return {
+        'image': images,
+        'flow': flows,
+        'labels': labels,
+    }
+
 def train_model(model, train_loader, val_loader, config, output_dir):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # Enable gradient checkpointing
     model = model.to(device)
-    if hasattr(model, 'encoder'):
-        model.encoder.gradient_checkpointing = True
-    if hasattr(model, 'decoder'):
-        model.decoder.gradient_checkpointing = True
     
-    # Setup training
+    # Setup optimizer and scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
-    scaler = torch.cuda.amp.GradScaler()  # for mixed precision training
+    scaler = torch.amp.GradScaler(device_type='cuda')
     
-    # Initialize metric trackers
+    # Initialize metrics
     best_map50 = 0
     metrics_history = {
         'train_loss': [],
@@ -54,27 +79,24 @@ def train_model(model, train_loader, val_loader, config, output_dir):
         'precision': [],
         'recall': []
     }
-    
-    # Create output directory
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     for epoch in range(config['epochs']):
         # Training phase
         model.train()
-        train_loss = 0
+        total_loss = 0
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config["epochs"]}')
         
         for batch_idx, batch in enumerate(progress_bar):
+            # Move data to device
             images = batch['image'].to(device)
             flows = batch['flow'].to(device)
             labels = batch['labels'].to(device)
             
-            # Get non-empty label masks
-            valid_labels = (labels.sum(dim=2) > 0)
-            
             # Mixed precision training
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 # Forward pass
                 pred_boxes, pred_logits = model(images, flows)
                 
@@ -86,145 +108,120 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                     labels[..., 0]    # class labels
                 )
             
-            # Backward pass with gradient scaling
+            # Backward pass
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             
             # Update metrics
-            train_loss += loss.item()
-            
-            # Format predictions for metric update
-            predictions = [{
-                'boxes': boxes,
-                'scores': scores,
-                'labels': lbls,
-            } for boxes, scores, lbls in zip(
-                pred_boxes.detach(),
-                torch.softmax(pred_logits.detach(), dim=-1).max(dim=-1).values,
-                torch.argmax(pred_logits.detach(), dim=-1)
-            )]
-            
-            # Format targets for metric update
-            targets = [{
-                'boxes': label[label[:, 0] >= 0][:, 1:],
-                'labels': label[label[:, 0] >= 0][:, 0].long(),
-            } for label in labels]
-            
-            model.map_metric.update(predictions, targets)
+            total_loss += loss.item()
             
             # Update progress bar
             progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}'
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
             })
             
-            # Clear cache periodically
-            if batch_idx % 10 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Update training metrics
+            target_list = []
+            for i in range(len(labels)):
+                valid_mask = labels[i, :, 0] >= 0
+                target_list.append({
+                    'boxes': labels[i, valid_mask, 1:].cpu(),
+                    'labels': labels[i, valid_mask, 0].long().cpu()
+                })
+            
+            # Format predictions for metrics
+            pred_list = []
+            for i in range(len(pred_boxes)):
+                scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]  # Remove background class
+                pred_list.append({
+                    'boxes': pred_boxes[i].detach().cpu(),
+                    'scores': scores.max(dim=-1)[0].detach().cpu(),
+                    'labels': scores.argmax(dim=-1).detach().cpu()
+                })
+            
+            model.map_metric.update(pred_list, target_list)
         
-        # Calculate epoch metrics
-        train_loss = train_loss / len(train_loader)
-        train_metrics = model.map_metric.compute()
-        model.map_metric.reset()
+        avg_loss = total_loss / len(train_loader)
         
         # Validation phase
         model.eval()
         val_loss = 0
+        val_preds = []
+        val_targets = []
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
+            print("\nValidation:")
+            for batch in tqdm(val_loader):
                 images = batch['image'].to(device)
                 flows = batch['flow'].to(device)
                 labels = batch['labels'].to(device)
-                valid_labels = (labels.sum(dim=2) > 0)
                 
-                with torch.cuda.amp.autocast():
-                    # Forward pass
+                with torch.amp.autocast(device_type='cuda'):
                     pred_boxes, pred_logits = model(images, flows)
-                    
-                    # Calculate loss
                     loss = model.loss_fn(
                         pred_boxes,
                         pred_logits,
-                        labels[valid_labels][:, 1:],
-                        labels[valid_labels][:, 0].long()
+                        labels[..., 1:],
+                        labels[..., 0]
                     )
                 
                 val_loss += loss.item()
                 
-                # Update metrics
-                predictions = [{
-                    'boxes': boxes,
-                    'scores': scores,
-                    'labels': lbls,
-                } for boxes, scores, lbls in zip(
-                    pred_boxes,
-                    torch.softmax(pred_logits, dim=-1).max(dim=-1).values,
-                    torch.argmax(pred_logits, dim=-1)
-                )]
-                
-                targets = [{
-                    'boxes': label[label[:, 0] >= 0][:, 1:],
-                    'labels': label[label[:, 0] >= 0][:, 0].long(),
-                } for label in labels]
-                
-                model.map_metric.update(predictions, targets)
+                # Format validation predictions and targets
+                for i in range(len(labels)):
+                    valid_mask = labels[i, :, 0] >= 0
+                    val_targets.append({
+                        'boxes': labels[i, valid_mask, 1:].cpu(),
+                        'labels': labels[i, valid_mask, 0].long().cpu()
+                    })
+                    
+                    scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]
+                    val_preds.append({
+                        'boxes': pred_boxes[i].cpu(),
+                        'scores': scores.max(dim=-1)[0].cpu(),
+                        'labels': scores.argmax(dim=-1).cpu()
+                    })
         
-        # Calculate validation metrics
-        val_loss = val_loss / len(val_loader)
-        val_metrics = model.map_metric.compute()
+        # Compute validation metrics
+        model.map_metric.update(val_preds, val_targets)
+        metrics = model.get_metrics()
         model.map_metric.reset()
         
-        # Update metrics history
-        metrics_history['train_loss'].append(train_loss)
-        metrics_history['val_loss'].append(val_loss)
-        metrics_history['mAP50'].append(val_metrics['map_50'].item())
-        metrics_history['mAP50-95'].append(val_metrics['map'].item())
-        metrics_history['precision'].append(val_metrics['map_per_class'].mean().item())
-        metrics_history['recall'].append(val_metrics['mar_100'].item())
+        # Log metrics
+        print(f"\nEpoch {epoch+1} Results:")
+        print(f"Training Loss: {avg_loss:.4f}")
+        print(f"Validation Loss: {val_loss/len(val_loader):.4f}")
+        print(f"mAP50: {metrics['mAP50']:.4f}")
+        print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
+        print(f"Precision: {metrics['precision']:.4f}")
+        print(f"Recall: {metrics['recall']:.4f}")
         
-        # Print epoch metrics
-        print(f"\nEpoch {epoch+1} metrics:")
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_loss:.4f}")
-        print(f"mAP50: {val_metrics['map_50']:.4f}")
-        print(f"mAP50-95: {val_metrics['map']:.4f}")
-        print(f"Precision: {val_metrics['map_per_class'].mean():.4f}")
-        print(f"Recall: {val_metrics['mar_100']:.4f}")
+        # Save metrics history
+        metrics_history['train_loss'].append(avg_loss)
+        metrics_history['val_loss'].append(val_loss/len(val_loader))
+        metrics_history['mAP50'].append(metrics['mAP50'])
+        metrics_history['mAP50-95'].append(metrics['mAP50-95'])
+        metrics_history['precision'].append(metrics['precision'])
+        metrics_history['recall'].append(metrics['recall'])
         
         # Save best model
-        if val_metrics['map_50'] > best_map50:
-            best_map50 = val_metrics['map_50']
-            checkpoint_path = output_dir / 'best_model.pt'
+        if metrics['mAP50'] > best_map50:
+            best_map50 = metrics['mAP50']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'metrics': val_metrics,
-                'config': config,
-            }, str(checkpoint_path))
-            print(f"Saved best model with mAP50: {best_map50:.4f}")
+                'metrics': metrics,
+            }, str(output_dir / 'best_model.pt'))
+            print(f"Saved new best model with mAP50: {best_map50:.4f}")
         
-        # Save latest model
-        checkpoint_path = output_dir / 'last_model.pt'
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'metrics': val_metrics,
-            'config': config,
-        }, str(checkpoint_path))
-        
-        # Save metrics history
-        metrics_path = output_dir / 'metrics_history.pth'
-        torch.save(metrics_history, str(metrics_path))
-        
-        # Clear cache between epochs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Save latest metrics
+        torch.save(metrics_history, str(output_dir / 'metrics_history.pt'))
+
+    return model, metrics_history
 
 def main():
     parser = argparse.ArgumentParser(description='Train Enhanced Detection Model')
@@ -236,7 +233,7 @@ def main():
                       help='Batch size')
     parser.add_argument('--img-size', type=int, default=416,
                       help='Input image size')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=50,
                       help='Number of epochs')
     parser.add_argument('--output-dir', type=str, default='runs/train',
                       help='Output directory')
@@ -271,14 +268,6 @@ def main():
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
     print(f"Using device: {device}")
-    
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save configuration
-    with open(output_dir / 'config.yaml', 'w') as f:
-        yaml.dump(config, f)
     
     try:
         # Create datasets
@@ -332,7 +321,7 @@ def main():
         
         # Train
         print("\nStarting training...")
-        train_model(model, train_loader, val_loader, config, args.output_dir)
+        model, metrics_history = train_model(model, train_loader, val_loader, config, args.output_dir)
         
     except Exception as e:
         print(f"Error during training: {str(e)}")

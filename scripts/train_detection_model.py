@@ -141,8 +141,11 @@ def train_model(model, train_loader, val_loader, config, output_dir):
                     
                     # Log shapes for debugging
                     if batch_idx == 0:
-                        logger.debug(f"Batch shapes - Images: {images.shape}, "
-                                   f"Flows: {flows.shape}, Labels: {labels.shape}")
+                        print("\nFirst batch samples:")
+                        print(f"Images shape: {images.shape}")
+                        print(f"Flows shape: {flows.shape}")
+                        print(f"Labels shape: {labels.shape}")
+                        print(f"Sample labels:\n{labels[0]}")
                     
                     # Zero gradients
                     optimizer.zero_grad(set_to_none=False)

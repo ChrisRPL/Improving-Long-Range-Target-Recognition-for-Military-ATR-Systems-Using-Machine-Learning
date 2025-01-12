@@ -40,59 +40,82 @@ class EnhancedObjectDetectionDataset(Dataset):
         return len(self.image_paths)
 
     def load_labels(self, img_path):
-        """Load YOLO format labels."""
+        """
+        Load labels from txt file.
+        Format: class_id x1 y1 x2 y1 x1 y2 x2 y2
+        """
         label_path = self.labels_dir / f"{img_path.stem}.txt"
-        if not label_path.exists():
-            return torch.zeros((1, 5))  # Return dummy label instead of empty tensor
-            
         try:
+            if not label_path.exists():
+                return torch.zeros((1, 5))
+
             labels = []
             with open(label_path, 'r') as f:
                 for line in f:
                     values = line.strip().split()
-                    if len(values) == 5:
-                        labels.append([float(x) for x in values])
-            
+                    if len(values) == 9:  # class_id + 8 coordinates
+                        # Parse values
+                        class_id = int(values[0])
+                        coords = [float(v) for v in values[1:]]
+                    
+                        # Convert from x1,y1,x2,y1,x1,y2,x2,y2 to YOLO format (x_center, y_center, width, height)
+                        x1 = min(coords[0], coords[2], coords[4], coords[6])
+                        x2 = max(coords[0], coords[2], coords[4], coords[6])
+                        y1 = min(coords[1], coords[3], coords[5], coords[7])
+                        y2 = max(coords[1], coords[3], coords[5], coords[7])
+                    
+                        # Calculate center coordinates and dimensions
+                        x_center = (x1 + x2) / 2
+                        y_center = (y1 + y2) / 2
+                        width = x2 - x1
+                        height = y2 - y1
+                    
+                        # Append in YOLO format: [class_id, x_center, y_center, width, height]
+                        labels.append([class_id, x_center, y_center, width, height])
+
             if not labels:
-                return torch.zeros((1, 5))  # Return dummy label if file is empty
-                
-            return torch.tensor(labels)
+                return torch.zeros((1, 5))
+
+            return torch.tensor(labels, dtype=torch.float32)
+
         except Exception as e:
             print(f"Error loading labels from {label_path}: {str(e)}")
-            return torch.zeros((1, 5))  # Return dummy label on error
+            return torch.zeros((1, 5))
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        
+    
         # Load image
         img = cv2.imread(str(img_path))
         if img is None:
             raise ValueError(f"Could not load image: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
+    
         # Load optical flow
         flow_path = self.flow_dir / f"{img_path.stem}_flow.npy"
         if flow_path.exists():
             flow = np.load(str(flow_path))
         else:
-            # Create zero flow with same size as image
             flow = np.zeros((img.shape[0], img.shape[1], 2), dtype=np.float32)
-        
-        # Resize both image and flow to target size
+    
+        # Load and verify labels
+        labels = self.load_labels(img_path)
+    
+        # For debugging (first few batches)
+        if idx < 5:
+            print(f"\nSample {idx}:")
+            print(f"Image path: {img_path}")
+            print(f"Label path: {self.labels_dir / f'{img_path.stem}.txt'}")
+            print(f"Labels loaded: {labels}")
+    
+        # Resize both image and flow
         img = cv2.resize(img, (self.image_size, self.image_size))
         flow = cv2.resize(flow, (self.image_size, self.image_size))
-        
-        # Load labels
-        labels = self.load_labels(img_path)
-        
+    
         # Convert to tensors and normalize
-        img = self.transform(img)  # Already includes normalization
-        flow = torch.from_numpy(flow).float().permute(2, 0, 1)  # [2, H, W]
-        
-        # Verify tensor shapes
-        assert img.shape[1:] == (self.image_size, self.image_size), f"Wrong image shape: {img.shape}"
-        assert flow.shape[1:] == (self.image_size, self.image_size), f"Wrong flow shape: {flow.shape}"
-        
+        img = self.transform(img)
+        flow = torch.from_numpy(flow).float().permute(2, 0, 1)
+    
         return {
             'image': img,
             'flow': flow,

@@ -4,6 +4,7 @@ import torchvision.models as models
 from torchmetrics.detection import MeanAveragePrecision
 import torch.nn.functional as F
 from torchvision.ops import box_iou as tv_box_iou
+from scipy.optimize import linear_sum_assignment
 import math
 
 
@@ -204,17 +205,23 @@ class EnhancedDetectionModel(nn.Module):
         Args:
             pred_boxes: [B, num_queries, 4] predicted boxes
             pred_logits: [B, num_queries, num_classes+1] predicted logits
-            target_boxes: [B, max_objects, 4] ground truth boxes
+            target_boxes: [B, max_objects, 4] ground truth boxes 
             target_labels: [B, max_objects] ground truth labels
         Returns:
             total_loss: scalar loss value
         """
         B = pred_boxes.shape[0]
         device = pred_boxes.device
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        box_loss_weight = 5.0  # weight for box loss
-        cls_loss_weight = 2.0  # weight for classification loss
+        # Loss weights
+        giou_loss_weight = 2.0
+        l1_loss_weight = 5.0
+        cls_loss_weight = 1.0
+
+        total_giou_loss = 0
+        total_l1_loss = 0
+        total_cls_loss = 0
+        num_boxes = 0
 
         for i in range(B):
             # Get valid targets (remove padding)
@@ -223,52 +230,110 @@ class EnhancedDetectionModel(nn.Module):
             batch_target_labels = target_labels[i][valid_mask]
 
             if len(batch_target_boxes) == 0:
-                # Add a small loss for empty targets to maintain gradient flow
-                total_loss = total_loss + pred_boxes[i].sum() * 0.01
                 continue
 
-            # Box loss (GIoU Loss)
-            iou = self.box_iou(
-                pred_boxes[i], batch_target_boxes
-            )  # [num_queries, num_targets]
+            # Calculate IoU between all predictions and targets
+            iou_matrix = self.box_iou(pred_boxes[i], batch_target_boxes)  # [num_queries, num_targets]
+        
+            # Hungarian matching to find best prediction-target pairs
+            cost_matrix = -iou_matrix
+            pred_indices, target_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
+            pred_indices = torch.as_tensor(pred_indices, dtype=torch.long, device=device)
+            target_indices = torch.as_tensor(target_indices, dtype=torch.long, device=device)
 
-            # For each predicted box, get the target with maximum IoU
-            max_iou, matched_idx = iou.max(dim=1)  # [num_queries]
+            # Get matched pairs
+            matched_pred_boxes = pred_boxes[i][pred_indices]
+            matched_target_boxes = batch_target_boxes[target_indices]
+        
+            # GIoU Loss
+            giou_loss = 1 - torch.diag(self.generalized_box_iou(
+                matched_pred_boxes, matched_target_boxes
+            )).mean()
 
-            # Calculate GIoU Loss
-            box_loss = (1 - max_iou).mean() * box_loss_weight
+            # L1 Loss
+            l1_loss = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='mean')
 
-            # Classification loss
-            # Match predictions with targets based on IoU
-            matched_labels = batch_target_labels[matched_idx]
+            # Classification Loss
+            target_classes = torch.full(
+                (pred_logits[i].shape[0],), 
+                self.num_classes,  # background class
+                dtype=torch.long, 
+                device=device
+            )
+            target_classes[pred_indices] = batch_target_labels[target_indices]
+        
+            cls_loss = F.cross_entropy(
+                pred_logits[i], 
+                target_classes,
+                reduction='mean'
+            )
 
-            # Create classification targets with background
-            cls_targets = torch.full(
-                (pred_logits[i].shape[0],),
-                self.num_classes,
-                dtype=torch.long,
-                device=device,
-            )  # Default to background class
+            # Weighted sum of losses
+            total_giou_loss += giou_loss * giou_loss_weight
+            total_l1_loss += l1_loss * l1_loss_weight
+            total_cls_loss += cls_loss * cls_loss_weight
+            num_boxes += len(pred_indices)
 
-            # Assign matched labels where IoU is above threshold
-            positive_mask = max_iou > 0.5
-            cls_targets[positive_mask] = matched_labels[positive_mask]
+            if i == 0:  # Print loss components for first batch item
+                print(f"\nLoss components - GIoU: {giou_loss.item():.4f}, "
+                      f"L1: {l1_loss.item():.4f}, "
+                      f"Class: {cls_loss.item():.4f}")
 
-            # Calculate classification loss
-            cls_loss = F.cross_entropy(pred_logits[i], cls_targets) * cls_loss_weight
+        # Average losses
+        if num_boxes > 0:
+            total_loss = (total_giou_loss + total_l1_loss + total_cls_loss) / num_boxes
+        else:
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-            # Add losses for this batch item
-            batch_loss = box_loss + cls_loss
-            total_loss = total_loss + batch_loss
-
-            # Print loss components for debugging
-            if i == 0:  # Print only for first item in batch
-                print(
-                    f"\nLoss components - Box: {box_loss.item():.4f}, Class: {cls_loss.item():.4f}"
-                )
-
-        avg_loss = total_loss / B
-        return avg_loss
+        return total_loss
+    
+    def generalized_box_iou(self, boxes1, boxes2):
+        """
+        Compute generalized IoU between two sets of boxes.
+        """
+        # Convert boxes to xyxy format
+        x1, y1, w1, h1 = boxes1.unbind(-1)
+        x2, y2, w2, h2 = boxes2.unbind(-1)
+    
+        b1_x1, b1_y1 = x1 - w1/2, y1 - h1/2
+        b1_x2, b1_y2 = x1 + w1/2, y1 + h1/2
+        b2_x1, b2_y1 = x2 - w2/2, y2 - h2/2
+        b2_x2, b2_y2 = x2 + w2/2, y2 + h2/2
+    
+        # Calculate areas
+        area1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        area2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    
+        # Calculate intersection
+        inter_x1 = torch.max(b1_x1, b2_x1)
+        inter_y1 = torch.max(b1_y1, b2_y1)
+        inter_x2 = torch.min(b1_x2, b2_x2)
+        inter_y2 = torch.min(b1_y2, b2_y2)
+    
+        inter_w = (inter_x2 - inter_x1).clamp(min=0)
+        inter_h = (inter_y2 - inter_y1).clamp(min=0)
+        intersection = inter_w * inter_h
+    
+        # Calculate union
+        union = area1 + area2 - intersection
+    
+        # Calculate IoU
+        iou = intersection / union.clamp(min=1e-6)
+    
+        # Calculate enclosing box
+        encl_x1 = torch.min(b1_x1, b2_x1)
+        encl_y1 = torch.min(b1_y1, b2_y1)
+        encl_x2 = torch.max(b1_x2, b2_x2)
+        encl_y2 = torch.max(b1_y2, b2_y2)
+    
+        encl_w = (encl_x2 - encl_x1).clamp(min=0)
+        encl_h = (encl_y2 - encl_y1).clamp(min=0)
+        enclosure = encl_w * encl_h
+    
+        # Calculate GIoU
+        giou = iou - (enclosure - union) / enclosure.clamp(min=1e-6)
+    
+        return giou
 
     def update_metrics(self, pred_boxes, pred_logits, targets):
         """Update evaluation metrics"""

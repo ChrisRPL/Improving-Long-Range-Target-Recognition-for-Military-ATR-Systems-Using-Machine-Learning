@@ -14,8 +14,38 @@ from models.detection_dataset import EnhancedObjectDetectionDataset
 from models.detection_model import EnhancedDetectionModel
 warnings.filterwarnings('ignore')
 import sys
+import logging
+from datetime import datetime
 
 sys.path.append(str(Path(__file__).parent.parent))
+
+def setup_logger(output_dir):
+    """Setup logging configuration"""
+    log_file = Path(output_dir) / f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Setup file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    
+    # Setup stream handler
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+    
+    # Setup logger
+    logger = logging.getLogger('training')
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    
+    return logger
 
 def load_yaml(yaml_path):
     """Load YAML configuration file and resolve paths."""
@@ -63,191 +93,235 @@ def collate_fn(batch: List[Dict]) -> Dict:
     }
 
 def train_model(model, train_loader, val_loader, config, output_dir):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    model = model.to(device)
+    # Setup logger
+    logger = setup_logger(output_dir)
+    logger.info("Starting training with configuration:")
+    logger.info(f"Config: {config}")
     
-    # Setup optimizer and scaler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
-    scaler = torch.cuda.amp.GradScaler()
-    
-    # Initialize metrics
-    best_map50 = 0
-    metrics_history = {
-        'train_loss': [],
-        'val_loss': [],
-        'mAP50': [],
-        'mAP50-95': [],
-        'precision': [],
-        'recall': []
-    }
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {device}")
+        model = model.to(device)
+        
+        # Log model architecture
+        logger.debug(f"Model architecture:\n{model}")
+        
+        # Setup optimizer and scaler
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.get('lr', 1e-4))
+        scaler = torch.cuda.amp.GradScaler()
+        logger.info(f"Optimizer: {optimizer}")
+        
+        # Initialize metrics
+        best_map50 = 0
+        metrics_history = {
+            'train_loss': [],
+            'val_loss': [],
+            'mAP50': [],
+            'mAP50-95': [],
+            'precision': [],
+            'recall': []
+        }
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(config['epochs']):
-        # Training phase
-        model.train()
-        total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config["epochs"]}')
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            images = batch['image'].to(device)
-            flows = batch['flow'].to(device)
-            labels = batch['labels'].to(device)
+        for epoch in range(config['epochs']):
+            logger.info(f"\nStarting epoch {epoch+1}/{config['epochs']}")
             
-            # Ensure optimizer gradients are zero
-            optimizer.zero_grad(set_to_none=False)
+            # Training phase
+            model.train()
+            total_loss = 0
+            progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config["epochs"]}')
             
-            with torch.cuda.amp.autocast():
-                # Forward pass
-                pred_boxes, pred_logits = model(images, flows)
-                
-                # Calculate loss
-                loss = model.loss_fn(
-                    pred_boxes,
-                    pred_logits,
-                    labels[..., 1:],  # bbox coordinates
-                    labels[..., 0]    # class labels
-                )
-                
-                # Print gradients for debugging
-                if batch_idx % 50 == 0:
-                    print(f"\nLoss value: {loss.item()}")
-            
-            # Check if loss requires grad
-            if not loss.requires_grad:
-                print("Warning: Loss does not require gradients!")
-            
-            # Backward pass
-            scaler.scale(loss).backward()
-            
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # Update metrics
-            total_loss += loss.item()
-            
-            # Update training metrics
-            target_list = []
-            for i in range(len(labels)):
-                valid_mask = labels[i, :, 0] >= 0
-                target_list.append({
-                    'boxes': labels[i, valid_mask, 1:].cpu(),
-                    'labels': labels[i, valid_mask, 0].long().cpu()
-                })
-            
-            # Format predictions for metrics
-            pred_list = []
-            for i in range(len(pred_boxes)):
-                scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]  # Remove background class
-                pred_list.append({
-                    'boxes': pred_boxes[i].detach().cpu(),
-                    'scores': scores.max(dim=-1)[0].detach().cpu(),
-                    'labels': scores.argmax(dim=-1).detach().cpu()
-                })
-            
-            model.map_metric.update(pred_list, target_list)
-            
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
-            })
-        
-        avg_loss = total_loss / len(train_loader)
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        val_preds = []
-        val_targets = []
-        
-        with torch.no_grad():
-            print("\nValidation:")
-            for batch in tqdm(val_loader):
-                images = batch['image'].to(device)
-                flows = batch['flow'].to(device)
-                labels = batch['labels'].to(device)
-                
-                with torch.cuda.amp.autocast():
-                    pred_boxes, pred_logits = model(images, flows)
-                    loss = model.loss_fn(
-                        pred_boxes,
-                        pred_logits,
-                        labels[..., 1:],
-                        labels[..., 0]
-                    )
-                
-                val_loss += loss.item()
-                
-                # Format validation predictions and targets
-                for i in range(len(labels)):
-                    valid_mask = labels[i, :, 0] >= 0
-                    val_targets.append({
-                        'boxes': labels[i, valid_mask, 1:].cpu(),
-                        'labels': labels[i, valid_mask, 0].long().cpu()
-                    })
+            for batch_idx, batch in enumerate(progress_bar):
+                try:
+                    images = batch['image'].to(device)
+                    flows = batch['flow'].to(device)
+                    labels = batch['labels'].to(device)
                     
-                    scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]
-                    val_preds.append({
-                        'boxes': pred_boxes[i].cpu(),
-                        'scores': scores.max(dim=-1)[0].cpu(),
-                        'labels': scores.argmax(dim=-1).cpu()
-                    })
-        
-        # Compute validation metrics
-        model.map_metric.update(val_preds, val_targets)
-        metrics = model.get_metrics()
-        model.map_metric.reset()
-        
-        # Log metrics
-        print(f"\nEpoch {epoch+1} Results:")
-        print(f"Training Loss: {avg_loss:.4f}")
-        print(f"Validation Loss: {val_loss/len(val_loader):.4f}")
-        print(f"mAP50: {metrics['mAP50']:.4f}")
-        print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
-        print(f"Precision: {metrics['precision']:.4f}")
-        print(f"Recall: {metrics['recall']:.4f}")
-        
-        # Save metrics history
-        metrics_history['train_loss'].append(avg_loss)
-        metrics_history['val_loss'].append(val_loss/len(val_loader))
-        metrics_history['mAP50'].append(metrics['mAP50'])
-        metrics_history['mAP50-95'].append(metrics['mAP50-95'])
-        metrics_history['precision'].append(metrics['precision'])
-        metrics_history['recall'].append(metrics['recall'])
-        
-        # Save best model
-        if metrics['mAP50'] > best_map50:
-            best_map50 = metrics['mAP50']
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'metrics': metrics,
-                'config': config,
-            }, str(output_dir / 'best_model.pt'))
-            print(f"Saved new best model with mAP50: {best_map50:.4f}")
-        
-        # Save latest model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'metrics': metrics,
-            'config': config,
-        }, str(output_dir / 'last_model.pt'))
-        
-        # Save metrics history
-        torch.save(metrics_history, str(output_dir / 'metrics_history.pt'))
-
+                    # Log shapes for debugging
+                    if batch_idx == 0:
+                        logger.debug(f"Batch shapes - Images: {images.shape}, "
+                                   f"Flows: {flows.shape}, Labels: {labels.shape}")
+                    
+                    optimizer.zero_grad(set_to_none=False)
+                    
+                    with torch.cuda.amp.autocast():
+                        # Forward pass
+                        pred_boxes, pred_logits = model(images, flows)
+                        
+                        # Log predictions shape
+                        if batch_idx == 0:
+                            logger.debug(f"Prediction shapes - Boxes: {pred_boxes.shape}, "
+                                       f"Logits: {pred_logits.shape}")
+                        
+                        # Calculate loss
+                        loss = model.loss_fn(
+                            pred_boxes,
+                            pred_logits,
+                            labels[..., 1:],
+                            labels[..., 0]
+                        )
+                        
+                        # Log loss components
+                        if batch_idx % 50 == 0:
+                            logger.info(f"Batch {batch_idx} - Loss: {loss.item():.4f}")
+                            
+                            # Log gradients for debugging
+                            for name, param in model.named_parameters():
+                                if param.requires_grad and param.grad is not None:
+                                    logger.debug(f"Gradient stats for {name}: "
+                                               f"mean={param.grad.mean():.4e}, "
+                                               f"std={param.grad.std():.4e}")
+                    
+                    if not loss.requires_grad:
+                        logger.warning("Loss does not require gradients!")
+                    
+                    # Backward pass
+                    scaler.scale(loss).backward()
+                    
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                    
+                    # Optimizer step
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    # Update metrics
+                    total_loss += loss.item()
+                    
+                    # Format targets and predictions for metrics
+                    try:
+                        target_list = []
+                        for i in range(len(labels)):
+                            valid_mask = labels[i, :, 0] >= 0
+                            target_list.append({
+                                'boxes': labels[i, valid_mask, 1:].cpu(),
+                                'labels': labels[i, valid_mask, 0].long().cpu()
+                            })
+                        
+                        pred_list = []
+                        for i in range(len(pred_boxes)):
+                            scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]
+                            pred_list.append({
+                                'boxes': pred_boxes[i].detach().cpu(),
+                                'scores': scores.max(dim=-1)[0].detach().cpu(),
+                                'labels': scores.argmax(dim=-1).detach().cpu()
+                            })
+                        
+                        model.map_metric.update(pred_list, target_list)
+                    except Exception as e:
+                        logger.error(f"Error updating metrics: {str(e)}")
+                        logger.debug(f"Target list: {target_list}")
+                        logger.debug(f"Prediction list: {pred_list}")
+                
+                except Exception as e:
+                    logger.error(f"Error in training batch {batch_idx}: {str(e)}")
+                    logger.debug(f"Batch contents: {batch}")
+                    raise
+            
+            avg_loss = total_loss / len(train_loader)
+            logger.info(f"Average training loss for epoch {epoch+1}: {avg_loss:.4f}")
+            
+            # Validation phase
+            try:
+                model.eval()
+                val_loss = 0
+                val_preds = []
+                val_targets = []
+                
+                logger.info("Starting validation...")
+                with torch.no_grad():
+                    for batch_idx, batch in enumerate(tqdm(val_loader)):
+                        images = batch['image'].to(device)
+                        flows = batch['flow'].to(device)
+                        labels = batch['labels'].to(device)
+                        
+                        with torch.cuda.amp.autocast():
+                            pred_boxes, pred_logits = model(images, flows)
+                            loss = model.loss_fn(
+                                pred_boxes,
+                                pred_logits,
+                                labels[..., 1:],
+                                labels[..., 0]
+                            )
+                        
+                        val_loss += loss.item()
+                        
+                        # Format validation predictions and targets
+                        for i in range(len(labels)):
+                            valid_mask = labels[i, :, 0] >= 0
+                            val_targets.append({
+                                'boxes': labels[i, valid_mask, 1:].cpu(),
+                                'labels': labels[i, valid_mask, 0].long().cpu()
+                            })
+                            
+                            scores = torch.softmax(pred_logits[i], dim=-1)[:, 1:]
+                            val_preds.append({
+                                'boxes': pred_boxes[i].cpu(),
+                                'scores': scores.max(dim=-1)[0].cpu(),
+                                'labels': scores.argmax(dim=-1).cpu()
+                            })
+                
+                # Compute validation metrics
+                model.map_metric.update(val_preds, val_targets)
+                metrics = model.get_metrics()
+                model.map_metric.reset()
+                
+                # Log metrics
+                logger.info(f"\nEpoch {epoch+1} Results:")
+                logger.info(f"Training Loss: {avg_loss:.4f}")
+                logger.info(f"Validation Loss: {val_loss/len(val_loader):.4f}")
+                logger.info(f"mAP50: {metrics['mAP50']:.4f}")
+                logger.info(f"mAP50-95: {metrics['mAP50-95']:.4f}")
+                logger.info(f"Precision: {metrics['precision']:.4f}")
+                logger.info(f"Recall: {metrics['recall']:.4f}")
+                
+                # Update metrics history
+                metrics_history['train_loss'].append(avg_loss)
+                metrics_history['val_loss'].append(val_loss/len(val_loader))
+                metrics_history['mAP50'].append(metrics['mAP50'])
+                metrics_history['mAP50-95'].append(metrics['mAP50-95'])
+                metrics_history['precision'].append(metrics['precision'])
+                metrics_history['recall'].append(metrics['recall'])
+                
+                # Save best model
+                if metrics['mAP50'] > best_map50:
+                    best_map50 = metrics['mAP50']
+                    checkpoint_path = output_dir / 'best_model.pt'
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'metrics': metrics,
+                        'config': config,
+                    }, str(checkpoint_path))
+                    logger.info(f"Saved new best model with mAP50: {best_map50:.4f}")
+                
+                # Save latest model
+                checkpoint_path = output_dir / 'last_model.pt'
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'metrics': metrics,
+                    'config': config,
+                }, str(checkpoint_path))
+                
+                # Save metrics history
+                torch.save(metrics_history, str(output_dir / 'metrics_history.pt'))
+                
+            except Exception as e:
+                logger.error(f"Error during validation: {str(e)}")
+                raise
+            
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        raise
+    
+    logger.info("Training completed successfully")
     return model, metrics_history
 
 def main():

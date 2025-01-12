@@ -11,6 +11,11 @@ import logging
 from typing import Dict, List, Tuple
 import random
 import os
+from torchvision.transforms import functional as F_vision
+from PIL import Image
+import numpy as np
+from pathlib import Path
+from typing import Dict, List
 
 class EnhancedObjectDetectionDataset(Dataset):
     def __init__(self, 
@@ -85,6 +90,25 @@ class EnhancedObjectDetectionDataset(Dataset):
         
         # Verify all files exist
         self._verify_files()
+
+    def _strict_resize(self, img: np.ndarray, size: int) -> np.ndarray:
+        """Ensure exact size after resize"""
+        # First convert to PIL Image for consistent resizing
+        if isinstance(img, np.ndarray):
+            if len(img.shape) == 3 and img.shape[2] == 2:  # Flow data
+                resized_h = cv2.resize(img[..., 0], (size, size))
+                resized_v = cv2.resize(img[..., 1], (size, size))
+                resized = np.stack([resized_h, resized_v], axis=-1)
+            else:  # Regular image
+                img_pil = Image.fromarray(img)
+                img_pil = img_pil.resize((size, size), Image.Resampling.BILINEAR)
+                resized = np.array(img_pil)
+        
+        # Verify size
+        if resized.shape[0] != size or resized.shape[1] != size:
+            raise ValueError(f"Resize failed: got shape {resized.shape}, expected {size}x{size}")
+        
+        return resized
         
     def _verify_files(self):
         """Verify all required files exist"""
@@ -105,46 +129,6 @@ class EnhancedObjectDetectionDataset(Dataset):
         if missing_flows:
             self.logger.warning(f"Missing {len(missing_flows)} flow files")
     
-    def _get_transforms(self):
-        """Get augmentation pipeline"""
-        if self.augment:
-            return A.Compose([
-            A.RandomScale(scale_limit=0.2),
-            A.RandomRotate90(p=0.3),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.1),
-            A.OneOf([
-                A.RandomBrightnessContrast(),
-                A.RandomGamma(),
-                A.HueSaturationValue()
-            ], p=0.3),
-            A.OneOf([
-                A.GaussNoise(),
-                A.GaussianBlur(),
-                A.MotionBlur()
-            ], p=0.2),
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-            ToTensorV2()
-        ], bbox_params=A.BboxParams(
-            format='coco',
-            label_fields=['category_ids'],
-            min_visibility=0.3
-        ))
-        else:
-            return A.Compose([
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-            ToTensorV2()
-        ], bbox_params=A.BboxParams(
-            format='coco',
-            label_fields=['category_ids']
-        ))
-    
     def __len__(self):
         return len(self.image_ids)
     
@@ -153,8 +137,8 @@ class EnhancedObjectDetectionDataset(Dataset):
         flow_path = self.image_dir.parent / 'flow' / f"{img_path.stem}_flow.npy"
         try:
             flow = np.load(str(flow_path))
-            # Resize flow to match image_size
-            flow = cv2.resize(flow, (self.image_size, self.image_size))
+            # Use strict resize for flow
+            flow = self._strict_resize(flow, self.image_size)
             return flow.astype(np.float32)
         except Exception as e:
             self.logger.warning(f"Error loading flow {flow_path}: {str(e)}")
@@ -172,8 +156,9 @@ class EnhancedObjectDetectionDataset(Dataset):
                 raise ValueError(f"Could not load image: {img_path}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Resize image to target size
-            image = cv2.resize(image, (self.image_size, self.image_size))
+            # Use strict resize for image
+            image = self._strict_resize(image, self.image_size)
+            
         except Exception as e:
             self.logger.error(f"Error loading image {img_path}: {str(e)}")
             raise
@@ -212,7 +197,14 @@ class EnhancedObjectDetectionDataset(Dataset):
             category_ids=labels
         )
         
+        # Verify transformed image size
         image = transformed['image']
+        if isinstance(image, torch.Tensor):
+            if image.shape[-2:] != (self.image_size, self.image_size):
+                raise ValueError(
+                    f"Unexpected image size after transform: {image.shape}, "
+                    f"expected *x{self.image_size}x{self.image_size}"
+                )
         
         # Handle transformed boxes safely
         transformed_bboxes = transformed.get('bboxes', [])
@@ -243,6 +235,42 @@ class EnhancedObjectDetectionDataset(Dataset):
             'img_id': img_id,
             'img_path': str(img_path)
         }
+
+    def _get_transforms(self):
+        """Get augmentation pipeline"""
+        if self.augment:
+            return A.Compose([
+                A.OneOf([
+                    A.RandomBrightnessContrast(),
+                    A.RandomGamma(),
+                    A.HueSaturationValue()
+                ], p=0.3),
+                A.OneOf([
+                    A.GaussNoise(),
+                    A.GaussianBlur(),
+                    A.MotionBlur()
+                ], p=0.2),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                ),
+                ToTensorV2()
+            ], bbox_params=A.BboxParams(
+                format='coco',
+                label_fields=['category_ids'],
+                min_visibility=0.3
+            ))
+        else:
+            return A.Compose([
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                ),
+                ToTensorV2()
+            ], bbox_params=A.BboxParams(
+                format='coco',
+                label_fields=['category_ids']
+            ))
     
     @staticmethod
     def _convert_to_cxcywh(boxes):

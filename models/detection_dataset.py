@@ -28,6 +28,16 @@ class EnhancedObjectDetectionDataset(Dataset):
             self.has_labels.append(label_path.exists())
         
         print(f"Found {sum(self.has_labels)} images with labels")
+        
+        # Setup transforms
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((self.image_size, self.image_size), antialias=True),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
 
     def load_labels(self, img_path):
         """Load YOLO format labels."""
@@ -50,31 +60,38 @@ class EnhancedObjectDetectionDataset(Dataset):
         except Exception as e:
             print(f"Error loading labels from {label_path}: {str(e)}")
             return torch.zeros((1, 5))  # Return dummy label on error
-            
-    def __len__(self):
-        return len(self.image_paths)
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         
-        # Load and process image
+        # Load image
         img = cv2.imread(str(img_path))
+        if img is None:
+            raise ValueError(f"Could not load image: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.image_size, self.image_size))
         
         # Load optical flow
         flow_path = self.flow_dir / f"{img_path.stem}_flow.npy"
         if flow_path.exists():
             flow = np.load(str(flow_path))
         else:
-            flow = np.zeros((self.image_size, self.image_size, 2), dtype=np.float32)
+            # Create zero flow with same size as image
+            flow = np.zeros((img.shape[0], img.shape[1], 2), dtype=np.float32)
+        
+        # Resize both image and flow to target size
+        img = cv2.resize(img, (self.image_size, self.image_size))
+        flow = cv2.resize(flow, (self.image_size, self.image_size))
         
         # Load labels
         labels = self.load_labels(img_path)
         
-        # Convert to tensors
-        img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
-        flow = torch.from_numpy(flow).float().permute(2, 0, 1)
+        # Convert to tensors and normalize
+        img = self.transform(img)  # Already includes normalization
+        flow = torch.from_numpy(flow).float().permute(2, 0, 1)  # [2, H, W]
+        
+        # Verify tensor shapes
+        assert img.shape[1:] == (self.image_size, self.image_size), f"Wrong image shape: {img.shape}"
+        assert flow.shape[1:] == (self.image_size, self.image_size), f"Wrong flow shape: {flow.shape}"
         
         return {
             'image': img,
@@ -82,32 +99,3 @@ class EnhancedObjectDetectionDataset(Dataset):
             'labels': labels,
             'img_path': str(img_path)
         }
-
-def collate_fn(batch):
-    """Custom collate function to handle variable number of labels."""
-    images = torch.stack([item['image'] for item in batch])
-    flows = torch.stack([item['flow'] for item in batch])
-    
-    # Find max number of labels in batch
-    max_labels = max(item['labels'].shape[0] for item in batch)
-    
-    # Pad labels to max length
-    padded_labels = []
-    for item in batch:
-        num_labels = item['labels'].shape[0]
-        if num_labels == 0:
-            # Handle empty labels
-            padding = torch.full((max_labels, 5), -1)
-            padded_labels.append(padding)
-        else:
-            padding = torch.full((max_labels - num_labels, 5), -1)
-            padded = torch.cat([item['labels'], padding], dim=0)
-            padded_labels.append(padded)
-    
-    labels = torch.stack(padded_labels)
-    
-    return {
-        'image': images,
-        'flow': flows,
-        'labels': labels,
-    }

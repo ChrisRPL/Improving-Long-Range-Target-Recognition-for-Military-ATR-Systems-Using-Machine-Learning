@@ -63,26 +63,24 @@ def load_yaml(yaml_path):
     
     return config
 
-def collate_fn(batch: List[Dict]) -> Dict:
-    """Custom collate function to handle variable number of labels."""
+def collate_fn(batch):
+    """
+    Custom collate function to handle batches.
+    """
     images = torch.stack([item['image'] for item in batch])
     flows = torch.stack([item['flow'] for item in batch])
     
-    # Find max number of labels in batch
+    # Get max number of labels in batch
     max_labels = max(item['labels'].shape[0] for item in batch)
     
-    # Pad labels to max length
+    # Pad labels to same size
     padded_labels = []
     for item in batch:
-        num_labels = item['labels'].shape[0]
-        if num_labels == 0:
-            # Handle empty labels
-            padding = torch.full((max_labels, 5), -1)
-            padded_labels.append(padding)
-        else:
-            padding = torch.full((max_labels - num_labels, 5), -1)
-            padded = torch.cat([item['labels'], padding], dim=0)
-            padded_labels.append(padded)
+        labels = item['labels']
+        if labels.shape[0] < max_labels:
+            padding = torch.zeros((max_labels - labels.shape[0], 5), dtype=labels.dtype)
+            labels = torch.cat([labels, padding], dim=0)
+        padded_labels.append(labels)
     
     labels = torch.stack(padded_labels)
     
@@ -90,6 +88,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'image': images,
         'flow': flows,
         'labels': labels,
+        'img_path': [item['img_path'] for item in batch]
     }
 
 def train_model(model, train_loader, val_loader, config, output_dir):

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchvision.ops import box_iou as tv_box_iou
 from scipy.optimize import linear_sum_assignment
 import math
+from torchvision.ops import box_iou
 
 
 class Backbone(nn.Module):
@@ -234,7 +235,7 @@ class EnhancedDetectionModel(nn.Module):
                 continue
 
             # Calculate IoU between predictions and targets
-            iou_matrix = box_iou(pred_boxes[i], batch_target_boxes)  # [num_queries, num_targets]
+            iou_matrix = self.box_iou(pred_boxes[i], batch_target_boxes)  # [num_queries, num_targets]
             print(f"IoU matrix shape: {iou_matrix.shape}, range: [{iou_matrix.min():.4f}, {iou_matrix.max():.4f}]")
 
             # Find best prediction for each target

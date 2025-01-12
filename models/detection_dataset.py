@@ -108,31 +108,31 @@ class EnhancedObjectDetectionDataset(Dataset):
         """Get augmentation pipeline"""
         if self.augment:
             return A.Compose([
-                A.RandomScale(scale_limit=0.2),
-                A.RandomRotate90(p=0.3),
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.1),
-                A.OneOf([
-                    A.RandomBrightnessContrast(),
-                    A.RandomGamma(),
-                    A.HueSaturationValue()
-                ], p=0.3),
-                A.OneOf([
-                    A.GaussNoise(),
-                    A.GaussianBlur(),
-                    A.MotionBlur()
-                ], p=0.2),
-                A.Resize(self.image_size, self.image_size),
-                A.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
-                ToTensorV2()
-            ], bbox_params=A.BboxParams(
+            A.RandomScale(scale_limit=0.2),
+            A.RandomRotate90(p=0.3),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+            A.OneOf([
+                A.RandomBrightnessContrast(),
+                A.RandomGamma(),
+                A.HueSaturationValue()
+            ], p=0.3),
+            A.OneOf([
+                A.GaussNoise(),
+                A.GaussianBlur(),
+                A.MotionBlur()
+            ], p=0.2),
+            A.Resize(self.image_size, self.image_size),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            ToTensorV2()
+        ], bbox_params=A.BboxParams(
             format='coco',
             label_fields=['category_ids'],
             min_visibility=0.3
-            ))
+        ))
         else:
             return A.Compose([
             A.Resize(self.image_size, self.image_size),
@@ -145,7 +145,6 @@ class EnhancedObjectDetectionDataset(Dataset):
             format='coco',
             label_fields=['category_ids']
         ))
-            ))
     
     def __len__(self):
         return len(self.image_ids)

@@ -250,7 +250,7 @@ def collate_fn(batch):
     
     return {
         'image': images,
-        'flow': flows
+        'flow': flows,
         'boxes': boxes,
         'labels': labels,
         'img_ids': [item['img_id'] for item in batch],

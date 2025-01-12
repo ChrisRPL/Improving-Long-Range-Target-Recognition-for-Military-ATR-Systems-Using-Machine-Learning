@@ -70,20 +70,25 @@ class FeaturePyramidNetwork(nn.Module):
 
         return results
 
+class PositionalEmbedding(nn.Module):
+    def __init__(self, d_model, size):
+        super().__init__()
+        self.embedding = nn.Parameter(torch.zeros(1, d_model, size, size))
+        nn.init.normal_(self.embedding, mean=0, std=0.02)
+    
+    def forward(self, x):
+        return self.embedding
+
 class MultiScaleTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8, num_layers=6):
         super().__init__()
         self.d_model = d_model
         
         # Create position embedding modules properly
-        self.pos_embeddings = nn.ModuleDict({
-            f'scale_{size}': nn.Parameter(torch.zeros(1, d_model, size, size))
+        self.pos_embeddings = nn.ModuleList([
+            PositionalEmbedding(d_model, size)
             for size in [64, 32, 16, 8]
-        })
-        
-        # Initialize position embeddings
-        for embed in self.pos_embeddings.values():
-            nn.init.normal_(embed, mean=0, std=0.02)
+        ])
         
         # Scale-specific transformers
         self.transformers = nn.ModuleList([
@@ -104,15 +109,16 @@ class MultiScaleTransformer(nn.Module):
     def forward(self, features):
         outputs = []
         
-        for idx, (feature, (_, pos_embed), transformer) in enumerate(zip(
+        for idx, (feature, pos_embed, transformer) in enumerate(zip(
             features, 
-            self.pos_embeddings.items(), 
+            self.pos_embeddings, 
             self.transformers
         )):
             B, C, H, W = feature.shape
             
             # Add positional encoding
-            feature = feature + F.interpolate(pos_embed, size=(H, W), mode='bilinear', align_corners=True)
+            pos_embedding = pos_embed(feature)
+            feature = feature + F.interpolate(pos_embedding, size=(H, W), mode='bilinear', align_corners=True)
             
             # Reshape for transformer
             feature = feature.flatten(2).transpose(1, 2)
@@ -135,6 +141,7 @@ class MultiScaleTransformer(nn.Module):
         ]
         
         return sum(w * out for w, out in zip(weights, scaled_outputs))
+        
 class EnhancedDetectionModel(nn.Module):
     def __init__(self, num_classes, num_queries=100):
         super().__init__()

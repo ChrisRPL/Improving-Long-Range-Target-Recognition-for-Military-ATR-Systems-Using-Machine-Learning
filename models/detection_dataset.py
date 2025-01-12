@@ -50,6 +50,9 @@ class EnhancedObjectDetectionDataset(Dataset):
         except Exception as e:
             print(f"Error loading labels from {label_path}: {str(e)}")
             return torch.zeros((1, 5))  # Return dummy label on error
+            
+    def __len__(self):
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]

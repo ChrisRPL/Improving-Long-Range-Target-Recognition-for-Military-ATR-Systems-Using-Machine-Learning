@@ -243,7 +243,7 @@ class EnhancedDetectionModel(nn.Module):
         return boxes, logits
     
     def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
-        """Calculate loss with Hungarian matching"""
+        """Calculate loss with Hungarian matching and proper index handling"""
         B = pred_boxes.shape[0]
         device = pred_boxes.device
         
@@ -256,49 +256,72 @@ class EnhancedDetectionModel(nn.Module):
         num_boxes = 0
         
         for i in range(B):
+            # Get valid targets for this batch
             valid_mask = (target_labels[i] > 0) & (target_labels[i] < self.num_classes)
             batch_target_boxes = target_boxes[i][valid_mask]
-            batch_target_labels = target_labels[i][valid_mask].long() - 1
+            batch_target_labels = target_labels[i][valid_mask].long()
             
             if valid_mask.sum() == 0:
+                # Handle case with no valid targets
+                dummy_loss = F.cross_entropy(
+                    pred_logits[i],
+                    torch.full((pred_logits.shape[1],), self.num_classes,
+                             dtype=torch.long, device=device)
+                )
+                total_loss = total_loss + dummy_loss * 0.1
                 continue
                 
             # Calculate cost matrix
             cost_bbox = torch.cdist(pred_boxes[i], batch_target_boxes, p=1)
             cost_giou = -self.generalized_box_iou(pred_boxes[i], batch_target_boxes)
-            cost_class = -pred_logits[i][:, batch_target_labels]
             
+            # Classification cost
+            cost_class = -pred_logits[i][:, batch_target_labels-1]  # Adjust indices for 0-based indexing
+            
+            # Combine costs
             C = (cost_bbox * box_loss_weight + 
                  cost_class * cls_loss_weight + 
                  cost_giou * giou_loss_weight)
             
-            indices = linear_sum_assignment(C.cpu().detach().numpy())
-            indices = (torch.as_tensor(indices[0], dtype=torch.long), 
-                      torch.as_tensor(indices[1], dtype=torch.long))
+            # Ensure cost matrix is on CPU for Hungarian matching
+            C_cpu = C.detach().cpu().numpy()
+            indices = linear_sum_assignment(C_cpu)
+            indices = (torch.as_tensor(indices[0], dtype=torch.long, device=device),
+                      torch.as_tensor(indices[1], dtype=torch.long, device=device))
             
             num_boxes += len(batch_target_labels)
             
             # Classification loss
             target_classes = torch.full(pred_logits[i].shape[:1], self.num_classes,
-                                      dtype=torch.int64, device=device)
-            target_classes[indices[0]] = batch_target_labels[indices[1]]
+                                      dtype=torch.long, device=device)
+            
+            # Safely assign target classes
+            if len(indices[0]) > 0:
+                target_classes[indices[0]] = batch_target_labels[indices[1]] - 1  # Convert to 0-based
             
             loss_ce = F.cross_entropy(pred_logits[i], target_classes)
             
-            # Box losses
-            matched_pred_boxes = pred_boxes[i][indices[0]]
-            matched_target_boxes = batch_target_boxes[indices[1]]
+            # Box losses for matched pairs only
+            if len(indices[0]) > 0:
+                matched_pred_boxes = pred_boxes[i][indices[0]]
+                matched_target_boxes = batch_target_boxes[indices[1]]
+                
+                loss_bbox = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='none').sum(1)
+                loss_giou = 1 - self.generalized_box_iou(matched_pred_boxes, matched_target_boxes)
+                
+                # Combine box losses
+                box_loss = loss_bbox.mean() * box_loss_weight + loss_giou.mean() * giou_loss_weight
+            else:
+                box_loss = torch.tensor(0., device=device)
             
-            loss_bbox = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='none').sum(1)
-            loss_giou = 1 - self.generalized_box_iou(matched_pred_boxes, matched_target_boxes)
-            
-            loss = (loss_bbox.mean() * box_loss_weight + 
-                    loss_ce * cls_loss_weight + 
-                    loss_giou.mean() * giou_loss_weight)
-            
-            total_loss = total_loss + loss
+            # Combine all losses
+            batch_loss = box_loss + loss_ce * cls_loss_weight
+            total_loss = total_loss + batch_loss
         
-        return total_loss / max(num_boxes, 1)
+        # Average total loss
+        avg_loss = total_loss / max(num_boxes, 1)
+        
+        return avg_loss
     
     def generalized_box_iou(self, boxes1, boxes2):
         """

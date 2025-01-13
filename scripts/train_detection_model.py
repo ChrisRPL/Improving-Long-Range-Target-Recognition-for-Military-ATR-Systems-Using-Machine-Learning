@@ -160,7 +160,7 @@ def train_model(args):
             labels = batch['labels'].to(device_type)
             
             # Forward pass with automatic mixed precision
-            with torch.amp.autocast(device_type):
+            with torch.amp.autocast('cuda'):
                 pred_boxes, pred_logits = model(images, flows)
                 loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)
             

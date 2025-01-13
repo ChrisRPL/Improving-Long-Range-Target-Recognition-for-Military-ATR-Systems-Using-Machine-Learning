@@ -422,68 +422,69 @@ class EnhancedDetectionModel(nn.Module):
     
         return giou
         
-    def update_metrics(self, pred_boxes, pred_logits, targets):
+    def update_metrics(self, pred_boxes, pred_logits, target_boxes, target_labels):
         """Update evaluation metrics with proper post-processing"""
         predictions = []
         processed_targets = []
-        
+    
         # Confidence threshold
         conf_threshold = 0.5
         nms_threshold = 0.5
-        
-        for i in range(len(targets)):
+    
+        batch_size = pred_boxes.size(0)
+        for i in range(batch_size):
             # Process predictions
             scores = torch.softmax(pred_logits[i], dim=-1)
             max_scores, pred_labels = scores.max(dim=-1)
-            
+        
             # Filter by confidence
             conf_mask = max_scores > conf_threshold
             filtered_boxes = pred_boxes[i][conf_mask]
             filtered_scores = max_scores[conf_mask]
             filtered_labels = pred_labels[conf_mask]
-            
+        
             # Convert boxes to xyxy format for NMS
-            filtered_boxes_xyxy = box_cxcywh_to_xyxy(filtered_boxes)
-            
+            filtered_boxes_xyxy = self.box_cxcywh_to_xyxy(filtered_boxes)
+        
             # Apply NMS per class
             final_boxes = []
             final_scores = []
             final_labels = []
-            
+        
             for class_id in filtered_labels.unique():
                 class_mask = filtered_labels == class_id
                 if not class_mask.any():
                     continue
-                    
+                
                 class_boxes = filtered_boxes_xyxy[class_mask]
                 class_scores = filtered_scores[class_mask]
-                
+            
                 keep_indices = nms(class_boxes, class_scores, nms_threshold)
-                
+            
                 final_boxes.append(filtered_boxes[class_mask][keep_indices])
                 final_scores.append(filtered_scores[class_mask][keep_indices])
                 final_labels.append(filtered_labels[class_mask][keep_indices])
-            
+        
             if final_boxes:
                 predictions.append({
-                    'boxes': torch.cat(final_boxes),
-                    'scores': torch.cat(final_scores),
-                    'labels': torch.cat(final_labels)
+                'boxes': torch.cat(final_boxes),
+                'scores': torch.cat(final_scores),
+                'labels': torch.cat(final_labels)
                 })
             else:
                 predictions.append({
-                    'boxes': torch.zeros((0, 4), device=pred_boxes.device),
-                    'scores': torch.zeros(0, device=pred_boxes.device),
-                    'labels': torch.zeros(0, dtype=torch.long, device=pred_boxes.device)
+                'boxes': torch.zeros((0, 4), device=pred_boxes.device),
+                'scores': torch.zeros(0, device=pred_boxes.device),
+                'labels': torch.zeros(0, dtype=torch.long, device=pred_boxes.device)
                 })
-            
-            # Process targets
-            valid_mask = targets[i]['labels'] > 0
-            processed_targets.append({
-                'boxes': targets[i]['boxes'][valid_mask],
-                'labels': targets[i]['labels'][valid_mask]
-            })
         
+            # Process targets
+            valid_mask = target_labels[i] > 0
+            processed_targets.append({
+                'boxes': target_boxes[i][valid_mask],
+                'labels': target_labels[i][valid_mask]
+            })
+    
         self.map_metric.update(predictions, processed_targets)
     
     def get_metrics(self):

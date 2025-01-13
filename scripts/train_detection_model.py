@@ -178,7 +178,12 @@ def train_model(args):
             
             # Update metrics
             train_loss += loss.item()
-            model.update_metrics(pred_boxes.detach(), pred_logits.detach(), boxes, labels)
+            model.update_metrics(
+                pred_boxes.detach(), 
+                pred_logits.detach(),
+                boxes,  # target boxes
+                labels  # target labels
+            )
             
             # Update progress bar
             pbar.set_postfix({'loss': loss.item()})
@@ -210,7 +215,12 @@ def train_model(args):
                 loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)
                 
                 val_loss += loss.item()
-                model.update_metrics(pred_boxes, pred_logits, boxes, labels)
+                model.update_metrics(
+                pred_boxes, 
+                pred_logits,
+                boxes,  # target boxes
+                labels  # target labels
+            )
         
         # Calculate validation metrics
         val_metrics = model.get_metrics()

@@ -143,10 +143,14 @@ def train_model(args):
     }
     
     for epoch in range(args.epochs):
+        logger.info(f"\nEpoch {epoch+1}/{args.epochs}")
+        
+        # Training phase
         model.train()
         train_loss = 0
         model.map_metric.reset()
         
+        train_loader = data_module.train_dataloader()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         
         for batch_idx, batch in enumerate(pbar):
@@ -165,8 +169,8 @@ def train_model(args):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             
             scaler.step(optimizer)
             scaler.update()
@@ -177,7 +181,7 @@ def train_model(args):
             model.update_metrics(pred_boxes.detach(), pred_logits.detach(), boxes, labels)
             
             # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            pbar.set_postfix({'loss': loss.item()})
             
             # Visualize batch occasionally
             if batch_idx % args.viz_interval == 0:

@@ -104,6 +104,9 @@ def train_model(args):
     
     category_names = data_module.get_category_names()
     
+    effective_batch_size = 32 
+    accumulation_steps = effective_batch_size // args.batch_size
+    
     # Create model
     device_type = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = EnhancedDetectionModel(num_classes=data_module.num_classes)
@@ -117,19 +120,22 @@ def train_model(args):
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        eps=1e-8
     )
     
     scaler = GradScaler(enabled=True)
     
     # Calculate total steps for scheduler
-    total_steps = len(data_module.train_dataloader()) * args.epochs
+    total_steps = (len(data_module.train_dataloader()) // accumulation_steps) * args.epochs
     
     scheduler = OneCycleLR(
         optimizer,
         max_lr=args.learning_rate,
         total_steps=total_steps,
         pct_start=0.1,
+        div_factor=10.0,
+        final_div_factor=100.0,
         anneal_strategy='cos'
     )
     
@@ -159,10 +165,14 @@ def train_model(args):
             boxes = batch['boxes'].to(device_type)
             labels = batch['labels'].to(device_type)
             
+            batch.clear()
+            torch.cuda.empty_cache()
+            
             # Forward pass with automatic mixed precision
-            with torch.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():
                 pred_boxes, pred_logits = model(images, flows)
                 loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)
+                loss = loss / accumulation_steps 
             
             # Backward pass
             optimizer.zero_grad()
@@ -177,7 +187,9 @@ def train_model(args):
             scheduler.step()
             
             # Update metrics
-            train_loss += loss.item()
+            train_loss += loss.item() * accumulation_steps
+            
+            
             model.update_metrics(
                 pred_boxes.detach(), 
                 pred_logits.detach(),
@@ -203,6 +215,12 @@ def train_model(args):
         model.eval()
         val_loss = 0
         model.map_metric.reset()
+        
+        del images, flows, boxes, labels, pred_boxes, pred_logits, loss
+            torch.cuda.empty_cache()
+            
+            if batch_idx % args.viz_interval == 0:
+                torch.cuda.empty_cache() 
         
         with torch.no_grad():
             for batch in tqdm(data_module.val_dataloader(), desc="Validation"):

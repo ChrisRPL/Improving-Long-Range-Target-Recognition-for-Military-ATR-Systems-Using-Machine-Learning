@@ -80,38 +80,49 @@ class PositionalEmbedding(nn.Module):
         return self.embedding
 
 class MultiScaleTransformer(nn.Module):
-    def __init__(self, d_model=256, nhead=8, num_layers=6):
+    def __init__(self, d_model=256, nhead=8, num_layers=3):  # Reduced num_layers
         super().__init__()
         self.d_model = d_model
+        
+        # Reduce number of scales
+        self.scales = [32, 16, 8]  # Removed largest scale to save memory
         
         # Create position embedding modules properly
         self.pos_embeddings = nn.ModuleList([
             PositionalEmbedding(d_model, size)
-            for size in [64, 32, 16, 8]
+            for size in self.scales
         ])
         
-        # Scale-specific transformers
+        # Scale-specific transformers with reduced complexity
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model*2,  # Reduced feedforward dimension
+            batch_first=True,
+            dropout=0.1,  # Added dropout for regularization
+        )
+        
         self.transformers = nn.ModuleList([
-            nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(
-                    d_model=d_model,
-                    nhead=nhead,
-                    dim_feedforward=d_model*4,
-                    batch_first=True
-                ),
-                num_layers=num_layers
-            )
-            for _ in range(4)
+            nn.TransformerEncoder(encoder_layer, num_layers)
+            for _ in range(len(self.scales))
         ])
         
-        self.scale_weights = nn.Parameter(torch.ones(4))
+        self.scale_weights = nn.Parameter(torch.ones(len(self.scales)))
+        
+        # Add memory-efficient fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(d_model * len(self.scales), d_model, 1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(inplace=True)
+        )
         
     def forward(self, features):
+        # Process only selected scales
         outputs = []
         
         for idx, (feature, pos_embed, transformer) in enumerate(zip(
-            features, 
-            self.pos_embeddings, 
+            features[-len(self.scales):],  # Take only the scales we want
+            self.pos_embeddings,
             self.transformers
         )):
             B, C, H, W = feature.shape
@@ -120,27 +131,49 @@ class MultiScaleTransformer(nn.Module):
             pos_embedding = pos_embed(feature)
             feature = feature + F.interpolate(pos_embedding, size=(H, W), mode='bilinear', align_corners=True)
             
-            # Reshape for transformer
-            feature = feature.flatten(2).transpose(1, 2)
+            # Process in chunks if feature is too large
+            if H * W > 1024:  # Threshold for chunking
+                chunks = []
+                chunk_size = 1024
+                for i in range(0, H * W, chunk_size):
+                    # Reshape and chunk
+                    chunk = feature.flatten(2)[:, :, i:i+chunk_size]
+                    if chunk.size(2) == 0:
+                        continue
+                    
+                    chunk = chunk.transpose(1, 2)
+                    chunk = transformer(chunk)
+                    chunk = chunk.transpose(1, 2)
+                    chunks.append(chunk)
+                
+                # Combine chunks
+                feature = torch.cat(chunks, dim=-1)
+                feature = feature.reshape(B, C, H, W)
+            else:
+                # Process normally for small features
+                feature = feature.flatten(2).transpose(1, 2)
+                feature = transformer(feature)
+                feature = feature.transpose(1, 2).reshape(B, C, H, W)
             
-            # Transform features
-            output = transformer(feature)
-            
-            # Reshape back
-            output = output.transpose(1, 2).reshape(B, C, H, W)
-            outputs.append(output)
+            outputs.append(feature)
         
-        # Combine scales with learned weights
-        weights = F.softmax(self.scale_weights, dim=0)
-        
-        # Resize all features to largest scale and combine
+        # Memory efficient fusion
         target_size = outputs[0].shape[-2:]
-        scaled_outputs = [
-            F.interpolate(output, size=target_size, mode='bilinear', align_corners=True)
-            for output in outputs
-        ]
+        scaled_outputs = []
         
-        return sum(w * out for w, out in zip(weights, scaled_outputs))
+        for output, weight in zip(outputs, F.softmax(self.scale_weights, dim=0)):
+            scaled_output = F.interpolate(output, size=target_size, mode='bilinear', align_corners=True)
+            scaled_outputs.append(scaled_output * weight)
+        
+        # Concatenate and fuse
+        multi_scale_features = torch.cat(scaled_outputs, dim=1)
+        fused_features = self.fusion(multi_scale_features)
+        
+        # Clean up to free memory
+        del outputs, scaled_outputs, multi_scale_features
+        torch.cuda.empty_cache()
+        
+        return fused_features
         
 class EnhancedDetectionModel(nn.Module):
     def __init__(self, num_classes, num_queries=100):

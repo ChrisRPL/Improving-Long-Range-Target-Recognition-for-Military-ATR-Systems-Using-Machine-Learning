@@ -216,12 +216,6 @@ def train_model(args):
         val_loss = 0
         model.map_metric.reset()
         
-        del images, flows, boxes, labels, pred_boxes, pred_logits, loss
-        torch.cuda.empty_cache()
-            
-        if batch_idx % args.viz_interval == 0:
-            torch.cuda.empty_cache() 
-        
         with torch.no_grad():
             for batch in tqdm(data_module.val_dataloader(), desc="Validation"):
                 images = batch['image'].to(device_type)

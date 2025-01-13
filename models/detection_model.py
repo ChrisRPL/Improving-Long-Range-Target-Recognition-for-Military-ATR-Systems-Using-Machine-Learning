@@ -276,7 +276,7 @@ class EnhancedDetectionModel(nn.Module):
         return boxes, logits
     
     def loss_fn(self, pred_boxes, pred_logits, target_boxes, target_labels):
-        """Calculate loss with proper box handling"""
+        """Calculate loss with proper box and class handling"""
         B = pred_boxes.shape[0]
         device = pred_boxes.device
     
@@ -290,100 +290,93 @@ class EnhancedDetectionModel(nn.Module):
     
         for i in range(B):
             # Get valid targets for this batch
-            valid_mask = (target_labels[i] > 0) & (target_labels[i] < self.num_classes)
+            valid_mask = target_labels[i] > 0  # Keep all valid classes
             batch_target_boxes = target_boxes[i][valid_mask]
             batch_target_labels = target_labels[i][valid_mask].long()
         
+            # Handle empty targets
             if valid_mask.sum() == 0:
-                # Handle case with no valid targets
-                dummy_loss = F.cross_entropy(
+                # Background classification loss
+                bg_loss = F.cross_entropy(
                     pred_logits[i],
-                    torch.full((pred_logits.shape[1],), self.num_classes,
-                         dtype=torch.long, device=device)
-                )  
-                total_loss = total_loss + dummy_loss * 0.1
+                    torch.zeros(pred_logits.shape[1], dtype=torch.long, device=device)
+                )
+                total_loss = total_loss + bg_loss * 0.1
                 continue
         
             # Calculate cost matrix
-            # L1 cost for boxes
             cost_bbox = torch.cdist(pred_boxes[i], batch_target_boxes, p=1)
         
-            # GIoU cost (make sure boxes are valid)
+            # Classification cost - handle background class properly
+            class_probs = F.softmax(pred_logits[i], dim=-1)
+            cost_class = -class_probs[:, batch_target_labels]
+        
+            # GIoU cost
             with torch.no_grad():
                 cost_giou = -self.generalized_box_iou(
-                pred_boxes[i].clamp(min=0, max=1),  # Ensure valid boxes
-                batch_target_boxes.clamp(min=0, max=1)
-            )
+                    pred_boxes[i],
+                    batch_target_boxes
+                )
         
-            # Classification cost
-            cost_class = -pred_logits[i][:, batch_target_labels-1]  # Adjust for 0-based indexing
-        
-            # Combine costs with safety checks
-            C = torch.nan_to_num(
+            # Combine costs
+            C = (
             cost_bbox * box_loss_weight +
             cost_class * cls_loss_weight +
-            cost_giou * giou_loss_weight,
-            nan=1e5
+            cost_giou * giou_loss_weight
             )
         
-            # Ensure cost matrix is valid
-            if torch.isnan(C).any() or torch.isinf(C).any():
-                self.logger.warning(f"Invalid values in cost matrix: batch {i}")
-                continue
-        
-            # Hungarian matching
-            C_cpu = C.detach().cpu().numpy()
-            try:
-                indices = linear_sum_assignment(C_cpu)
-                indices = (torch.as_tensor(indices[0], dtype=torch.long, device=device),
-                      torch.as_tensor(indices[1], dtype=torch.long, device=device))
-            except Exception as e:
-                self.logger.warning(f"Hungarian matching failed: {str(e)}")
-                continue
+            # Hungarian matching with cost matrix on CPU
+            indices = linear_sum_assignment(C.detach().cpu().numpy())
+            indices = (
+                torch.as_tensor(indices[0], dtype=torch.long, device=device),
+                torch.as_tensor(indices[1], dtype=torch.long, device=device)
+            )
         
             num_boxes += len(batch_target_labels)
         
-            # Classification loss
-            target_classes = torch.full(pred_logits[i].shape[:1], self.num_classes,
-                                  dtype=torch.long, device=device)
+            # Classification loss for all queries
+            target_classes = torch.full(
+                pred_logits[i].shape[:1], 
+                0,  # Background class
+                dtype=torch.long, 
+                device=device
+            )
+            target_classes[indices[0]] = batch_target_labels[indices[1]]
         
-            # Safely assign target classes
+            loss_ce = F.cross_entropy(
+                pred_logits[i],
+                target_classes,
+                label_smoothing=0.1  # Add label smoothing
+            )
+        
+            # Box losses for matched pairs
             if len(indices[0]) > 0:
-                target_classes[indices[0]] = batch_target_labels[indices[1]] - 1  # Convert to 0-based
-            
-                # Box losses for matched pairs
                 matched_pred_boxes = pred_boxes[i][indices[0]]
                 matched_target_boxes = batch_target_boxes[indices[1]]
             
-                # Calculate box regression loss
-                loss_bbox = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='none').sum(1)
+                # L1 loss
+                loss_bbox = F.l1_loss(
+                matched_pred_boxes, 
+                matched_target_boxes, 
+                reduction='none'
+                ).sum(1).mean()
             
-                # Calculate GIoU loss with safety checks
-                with torch.no_grad():
-                    giou = self.generalized_box_iou(
-                    matched_pred_boxes.clamp(min=0, max=1),
-                    matched_target_boxes.clamp(min=0, max=1)
-                    ).diag()
-                loss_giou = 1 - giou
+                # GIoU loss
+                loss_giou = (1 - self.generalized_box_iou(
+                matched_pred_boxes,
+                matched_target_boxes
+                )).mean()
             
                 # Combine box losses
-                box_loss = (loss_bbox.mean() * box_loss_weight + 
-                       loss_giou.mean() * giou_loss_weight)
+                box_loss = loss_bbox * box_loss_weight + loss_giou * giou_loss_weight
             else:
                 box_loss = torch.tensor(0., device=device)
         
-            # Classification loss
-            loss_ce = F.cross_entropy(pred_logits[i], target_classes)
-        
-            # Combine all losses with safety check
+            # Final loss
             batch_loss = box_loss + loss_ce * cls_loss_weight
-            if not torch.isnan(batch_loss) and not torch.isinf(batch_loss):
-                total_loss = total_loss + batch_loss
+            total_loss = total_loss + batch_loss
     
-        # Average total loss
-        avg_loss = total_loss / max(num_boxes, 1)
-    
-        return avg_loss
+        return total_loss / max(num_boxes, 1)
     
     def generalized_box_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         """
@@ -455,81 +448,99 @@ class EnhancedDetectionModel(nn.Module):
     
         return giou
         
-    def update_metrics(self, pred_boxes, pred_logits, target_boxes, target_labels):
-        """Update evaluation metrics with proper post-processing"""
-        predictions = []
-        processed_targets = []
-    
-        # Confidence threshold
-        conf_threshold = 0.5
-        nms_threshold = 0.5
-    
-        batch_size = pred_boxes.size(0)
-        for i in range(batch_size):
-            # Process predictions
-            scores = torch.softmax(pred_logits[i], dim=-1)
-            max_scores, pred_labels = scores.max(dim=-1)
-        
-            # Filter by confidence
-            conf_mask = max_scores > conf_threshold
-            filtered_boxes = pred_boxes[i][conf_mask]
-            filtered_scores = max_scores[conf_mask]
-            filtered_labels = pred_labels[conf_mask]
-        
-            # Convert boxes to xyxy format for NMS
-            filtered_boxes_xyxy = self.box_cxcywh_to_xyxy(filtered_boxes)
-        
-            # Apply NMS per class
-            final_boxes = []
-            final_scores = []
-            final_labels = []
-        
-            for class_id in filtered_labels.unique():
-                class_mask = filtered_labels == class_id
-                if not class_mask.any():
-                    continue
-                
-                class_boxes = filtered_boxes_xyxy[class_mask]
-                class_scores = filtered_scores[class_mask]
-            
-                keep_indices = nms(class_boxes, class_scores, nms_threshold)
-            
-                final_boxes.append(filtered_boxes[class_mask][keep_indices])
-                final_scores.append(filtered_scores[class_mask][keep_indices])
-                final_labels.append(filtered_labels[class_mask][keep_indices])
-        
-            if final_boxes:
-                predictions.append({
-                'boxes': torch.cat(final_boxes),
-                'scores': torch.cat(final_scores),
-                'labels': torch.cat(final_labels)
-                })
-            else:
-                predictions.append({
-                'boxes': torch.zeros((0, 4), device=pred_boxes.device),
-                'scores': torch.zeros(0, device=pred_boxes.device),
-                'labels': torch.zeros(0, dtype=torch.long, device=pred_boxes.device)
-                })
-        
-            # Process targets
-            valid_mask = target_labels[i] > 0
-            processed_targets.append({
-                'boxes': target_boxes[i][valid_mask],
-                'labels': target_labels[i][valid_mask]
-            })
-    
-        self.map_metric.update(predictions, processed_targets)
-    
-    def get_metrics(self):
-        """Get computed metrics"""
-        metrics = self.map_metric.compute()
-        return {
-            'mAP50': metrics['map_50'].item(),
-            'mAP50-95': metrics['map'].item(),
-            'precision': metrics['map_per_class'].mean().item(),
-            'recall': metrics['mar_100'].item(),
-            'per_class_map': metrics['map_per_class'].tolist()
-        }
+	def update_metrics(self, pred_boxes, pred_logits, target_boxes, target_labels):
+		"""Update evaluation metrics with proper post-processing"""
+		predictions = []
+		targets = []
+		
+		batch_size = pred_boxes.size(0)
+		
+		for i in range(batch_size):
+		    # Get valid targets
+		    valid_mask = target_labels[i] > 0
+		    batch_target_boxes = target_boxes[i][valid_mask]
+		    batch_target_labels = target_labels[i][valid_mask]
+		    
+		    # Process predictions
+		    scores = F.softmax(pred_logits[i], dim=-1)
+		    max_scores, pred_labels = scores.max(dim=-1)
+		    
+		    # Filter background predictions
+		    fg_mask = pred_labels > 0
+		    filtered_boxes = pred_boxes[i][fg_mask]
+		    filtered_scores = max_scores[fg_mask]
+		    filtered_labels = pred_labels[fg_mask]
+		    
+		    # Apply NMS per class
+		    if len(filtered_boxes) > 0:
+		        # Convert boxes to xyxy for NMS
+		        boxes_xyxy = self.box_cxcywh_to_xyxy(filtered_boxes)
+		        
+		        # Apply NMS per class
+		        keep_indices = []
+		        for class_id in filtered_labels.unique():
+		            class_mask = filtered_labels == class_id
+		            if not class_mask.any():
+		                continue
+		            
+		            class_boxes = boxes_xyxy[class_mask]
+		            class_scores = filtered_scores[class_mask]
+		            
+		            class_keep = nms(class_boxes, class_scores, iou_threshold=0.5)
+		            class_indices = torch.where(class_mask)[0][class_keep]
+		            keep_indices.extend(class_indices.tolist())
+		        
+		        keep_indices = torch.tensor(keep_indices, device=filtered_boxes.device)
+		        
+		        # Update predictions
+		        predictions.append({
+		            'boxes': filtered_boxes[keep_indices],
+		            'scores': filtered_scores[keep_indices],
+		            'labels': filtered_labels[keep_indices]
+		        })
+		    else:
+		        predictions.append({
+		            'boxes': torch.zeros((0, 4), device=pred_boxes.device),
+		            'scores': torch.zeros(0, device=pred_boxes.device),
+		            'labels': torch.zeros(0, dtype=torch.long, device=pred_boxes.device)
+		        })
+		    
+		    # Update targets
+		    if len(batch_target_boxes) > 0:
+		        targets.append({
+		            'boxes': batch_target_boxes,
+		            'labels': batch_target_labels
+		        })
+		    else:
+		        targets.append({
+		            'boxes': torch.zeros((0, 4), device=target_boxes.device),
+		            'labels': torch.zeros(0, dtype=torch.long, device=target_boxes.device)
+		        })
+		
+		# Update metrics
+		self.map_metric.update(predictions, targets)
+
+	def get_metrics(self):
+		"""Get computed metrics with proper handling"""
+		metrics = self.map_metric.compute()
+		
+		# Handle empty metrics case
+		if metrics['map_50'] is None or metrics['map'] is None:
+		    return {
+		        'mAP50': 0.0,
+		        'mAP50-95': 0.0,
+		        'precision': 0.0,
+		        'recall': 0.0,
+		        'per_class_map': [0.0] * self.num_classes
+		    }
+		
+		return {
+		    'mAP50': metrics['map_50'].item(),
+		    'mAP50-95': metrics['map'].item(),
+		    'precision': metrics['map_per_class'].mean().item(),
+		    'recall': metrics['mar_100'].item(),
+		    'per_class_map': metrics['map_per_class'].tolist()
+		}
     
     @staticmethod
     def box_cxcywh_to_xyxy(x):

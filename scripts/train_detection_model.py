@@ -105,9 +105,9 @@ def train_model(args):
     category_names = data_module.get_category_names()
     
     # Create model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device_type = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = EnhancedDetectionModel(num_classes=data_module.num_classes)
-    model = model.to(device)
+    model = model.to(device_type)
     
     # Save category mapping
     with open(output_dir / 'category_mapping.json', 'w') as f:
@@ -154,10 +154,10 @@ def train_model(args):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         
         for batch_idx, batch in enumerate(pbar):
-            images = batch['image'].to(device)
-            flows = batch['flow'].to(device)
-            boxes = batch['boxes'].to(device)
-            labels = batch['labels'].to(device)
+            images = batch['image'].to(device_type)
+            flows = batch['flow'].to(device_type)
+            boxes = batch['boxes'].to(device_type)
+            labels = batch['labels'].to(device_type)
             
             # Forward pass with automatic mixed precision
             with torch.amp.autocast(device_type):
@@ -201,10 +201,10 @@ def train_model(args):
         
         with torch.no_grad():
             for batch in tqdm(data_module.val_dataloader(), desc="Validation"):
-                images = batch['image'].to(device)
-                flows = batch['flow'].to(device)
-                boxes = batch['boxes'].to(device)
-                labels = batch['labels'].to(device)
+                images = batch['image'].to(device_type)
+                flows = batch['flow'].to(device_type)
+                boxes = batch['boxes'].to(device_type)
+                labels = batch['labels'].to(device_type)
                 
                 pred_boxes, pred_logits = model(images, flows)
                 loss = model.loss_fn(pred_boxes, pred_logits, boxes, labels)

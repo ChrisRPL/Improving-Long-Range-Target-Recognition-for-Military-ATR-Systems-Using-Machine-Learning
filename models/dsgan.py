@@ -2,56 +2,64 @@ import torch
 import torch.nn as nn
 
 class DSGenerator(nn.Module):
-    def __init__(self):
+    def __init__(self, input_channels=3, base_filters=64):
         super(DSGenerator, self).__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+        
+        # Encoder (downsampling)
+        self.encoder = nn.Sequential(
+            # input is (3) x 32 x 32
+            nn.Conv2d(input_channels, base_filters, 3, 1, 1),  # -> (64) x 32 x 32
+            nn.BatchNorm2d(base_filters),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            nn.Conv2d(base_filters, base_filters * 2, 3, 2, 1),  # -> (128) x 16 x 16
+            nn.BatchNorm2d(base_filters * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            nn.Conv2d(base_filters * 2, base_filters * 4, 3, 2, 1),  # -> (256) x 8 x 8
+            nn.BatchNorm2d(base_filters * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        
+        # Decoder (upsampling)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(base_filters * 4, base_filters * 2, 4, 2, 1),  # -> (128) x 16 x 16
+            nn.BatchNorm2d(base_filters * 2),
             nn.ReLU(True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            
+            nn.ConvTranspose2d(base_filters * 2, base_filters, 4, 2, 1),  # -> (64) x 32 x 32
+            nn.BatchNorm2d(base_filters),
             nn.ReLU(True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1),
+            
+            nn.Conv2d(base_filters, input_channels, 3, 1, 1),  # -> (3) x 32 x 32
             nn.Tanh()
         )
 
-    def forward(self, input):
-        return self.main(input)
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
 
 class DSDiscriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, input_channels=3, base_filters=64):
         super(DSDiscriminator, self).__init__()
+        
         self.main = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),
+            # input is (3) x 32 x 32
+            nn.Conv2d(input_channels, base_filters, 3, 2, 1),  # -> (64) x 16 x 16
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            
+            nn.Conv2d(base_filters, base_filters * 2, 3, 2, 1),  # -> (128) x 8 x 8
+            nn.BatchNorm2d(base_filters * 2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
+            
+            nn.Conv2d(base_filters * 2, base_filters * 4, 3, 2, 1),  # -> (256) x 4 x 4
+            nn.BatchNorm2d(base_filters * 4),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, kernel_size=4, stride=2, padding=1),
+            
+            nn.Conv2d(base_filters * 4, 1, 4, 1, 0),  # -> (1) x 1 x 1
             nn.Sigmoid()
         )
 
-    def forward(self, input):
-        return self.main(input)
-
+    def forward(self, x):
+        return self.main(x).view(-1)
